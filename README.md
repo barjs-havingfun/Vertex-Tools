@@ -1,6 +1,6 @@
 # Vertex Tools
 
-A Blender add-on with two point-by-point modeling tools, bundled in one
+A Blender add-on with three point-by-point modeling tools, bundled in one
 file (`vertex_tools.py`) and shown together in the sidebar under
 **N Panel > Tool > Vertex Tools**:
 
@@ -8,7 +8,9 @@ file (`vertex_tools.py`) and shown together in the sidebar under
   point into line with its neighbors, or extrude a new point that
   continues the pattern.
 - **Draw With Vertex**: click points in the viewport to build a face on a
-  plane, with grid, vertex and angle snapping.
+  plane, with grid, vertex, edge and angle snapping.
+- **Face Projection**: turn the view to look straight at any plane you
+  select (3 vertices, 2 edges or a face).
 
 ---
 
@@ -45,6 +47,21 @@ moved. Five ways to place it:
 - **Move to Average** — Simplest option: places the target at the
   centroid of all reference points.
 
+### Fix Whole Chain
+
+Straighten or smooth a whole chain in one click instead of fixing points
+one at a time. Select the chain either by clicking the vertices in order,
+or by selecting one connected path of edges (box select works for that).
+
+- **Chain: Even Along Line** — fits one straight line through all points
+  and spaces them evenly from the first to the last point.
+- **Chain: Even Along Curve** — fits a curve (adjustable degree) and
+  spaces the points at equal distances along it.
+
+In the redo panel (bottom left), switch **Placement** to
+`Keep Distance` to only snap each point onto the line/curve without
+changing the spacing.
+
 ### Extrude New Vertex
 
 No target vertex needed — select the chain (in order), pick a direction,
@@ -63,8 +80,8 @@ extending the chain one point at a time.
 
 | Property | Applies to | Description |
 |---|---|---|
-| Placement | Smart / Curve fix | `Average Distance` vs `Keep Distance` |
-| Curve Degree | Curve modes | 1 = line, 2 = arc, 3 = S-curve (capped at points − 1) |
+| Placement | Smart / Curve fix / Whole Chain | `Average Distance` vs `Keep Distance` |
+| Curve Degree | Curve modes / Whole Chain | 1 = line, 2 = arc, 3 = S-curve (capped at points − 1) |
 | Spacing Scale | Average Distance / Extrude | Multiplier on the computed spacing |
 | Window | All modes | Use only the last *N* selected points as reference (0 = use all). Useful for long or curved chains where only the local neighborhood should matter |
 
@@ -75,6 +92,8 @@ In Edit Mode, vertex select mode (`1`):
 - **Fix a point:** click your reference vertices in order, click the
   vertex to fix last, then run it from the **Average Vertex** section or
   the `Vertex` menu.
+- **Fix a whole chain:** click the chain in order (or select its edges),
+  then run Chain: Even Along Line/Curve.
 - **Extend a chain:** click the chain vertices in order, then run
   Extrude Along Line/Curve. Repeat with `Shift+R` to keep going.
 
@@ -103,8 +122,19 @@ shows the outline and, optionally, a filled face.
 
 ### Snapping
 
-- **Snap to Vertices** — snaps to existing mesh vertices; the new face is
-  welded to them, so it connects to your existing geometry.
+- **Snap to Vertices** — snaps the cursor to existing mesh vertices.
+- **Snap to Edges** (`E` to toggle) — snaps onto an existing edge, the
+  edge is highlighted pink. Near the middle of the edge it snaps exactly
+  to the midpoint. With Merge on, the edge is split at that point, so the
+  new face connects to it (and to the faces next to it). Vertex snap
+  wins over edge snap when both are in range.
+- **Merge** (on by default, `M` to toggle) — a point that sits on an
+  existing vertex or edge is merged with it, so the new face really connects to
+  your mesh (shared vertices and edges, no duplicates stacked on top).
+  This also catches points that land on a vertex through grid or angle
+  snapping, within **Merge Distance**. The cursor turns **blue** when the
+  point will merge. With Merge off, a separate vertex is created on top
+  of the existing one instead.
 - **Snap to Grid** — snaps to a grid on the drawing plane (adjustable
   Grid Size). On axis planes the grid lines up with the world grid.
 - **Ctrl angle snap** — hold `Ctrl` to constrain the direction from the
@@ -122,11 +152,53 @@ The new face is oriented so its normal points toward the viewer.
 | `X` / `Y` / `Z` | Lock the plane to that axis (press again to return to View) |
 | `G` | Toggle grid snap |
 | `V` | Toggle vertex snap |
+| `E` | Toggle edge snap |
+| `M` | Toggle merge |
 | `F` | Toggle fill preview |
 | `Backspace` / `Ctrl+Z` | Remove the last point |
 | `Enter` / `Space` / `RMB` | Finish and create the face |
 | `Esc` | Cancel |
 | `MMB` / wheel | Orbit, pan and zoom as usual (the plane stays fixed) |
+
+---
+
+## Face Projection
+
+### What it does
+
+Turns the view so you look straight down onto the plane of your
+selection, like Blender's `Shift+Numpad 7` (Align View to Active), but it
+also works for vertices and edges, not only faces:
+
+| Selection | Plane used |
+|---|---|
+| 3 vertices | The plane through them |
+| 2 edges | The best-fit plane through their vertices |
+| 1 or more faces | The faces' normal (you look at the front side) |
+| More vertices | The best-fit plane through all of them |
+
+Points that are all on one line don't define a plane and give an error.
+
+### Buttons
+
+- **Align View to Selection** — aligns, centers the view on the selection
+  and switches to orthographic.
+- **Align View + Cursor (Draw)** — the same, and also moves and rotates
+  the 3D cursor onto the plane. Then run **Draw With Vertex** with the
+  **View** plane to draw new faces exactly on that slanted plane.
+
+### Options (redo panel, bottom left)
+
+| Property | Description |
+|---|---|
+| Roll | How the view is turned on screen: `World Up` (default, world Z stays up like the Front/Side views; flat planes get world Y up like the Top view), `Edge Horizontal` (the first two clicked vertices, or the longest selected edge, lie horizontal) or `Keep Current` |
+| Flip | Look at the plane from the other side |
+| Center View | Center the view on the selection |
+| Orthographic | Switch to an orthographic view |
+| Move 3D Cursor | Move and rotate the 3D cursor onto the plane |
+
+For vertices and edges, the view stays on the side you're currently
+looking from.
 
 ---
 
@@ -138,8 +210,8 @@ The new face is oriented so its normal points toward the viewer.
 2. `Edit > Preferences > Add-ons > Install...`, pick `vertex_tools.py`.
 3. Enable **Vertex Tools**.
 4. In Edit Mode, press `N` and open the `Tool` tab: you'll find the
-   **Vertex Tools** panel with the **Average Vertex** and **Draw With
-   Vertex** sections.
+   **Vertex Tools** panel with the **Average Vertex**, **Draw With
+   Vertex** and **Face Projection** sections.
 
 ## Requirements
 
