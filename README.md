@@ -197,6 +197,39 @@ at the bottom tells you what was used.
 The shape has to stay inside the face; if it goes outside, nothing is
 changed and you get a message. New faces keep the old face's direction.
 
+#### Draw on Face vs. Blender's Knife tool (`K`)
+
+Both put new edges into an existing face, but they're built for
+different jobs.
+
+**Where Draw on Face is better:**
+
+| | Draw on Face | Knife tool |
+|---|---|---|
+| **Exact shapes** | Rectangles and circles / polygons (any number of sides) in two clicks | Only point by point; a circle has to be clicked out by hand |
+| **Stays flat** | Everything is flattened onto the face's plane, even if a point was off | Follows the surface where you click; no flattening |
+| **Grid snapping** | Grid on the face's own plane, plus `Ctrl` angle steps | Snaps to vertices / edges / midpoints, angle steps with `A`, no grid |
+| **What happens to the rest of the face** | You choose afterwards: **Cut In**, **Replace (leave gap)** or **Auto-Bridge**, and can switch in the redo panel without redrawing | Always cut in; anything else is manual work afterwards |
+| **Filling around a shape** | Auto-Bridge fills the ring for you, with Attach Mode, Twist and Quad Angle controls, and checks it never overlaps | Not available (Bridge Edge Loops afterwards, by hand) |
+| **Holes in a face** | Handled for you: 2 connecting edges (Cut In) or a filled ring (Auto-Bridge) | Also connects a loop floating inside a face, but you don't choose how |
+| **Result** | The new shape is a ready face, selected, facing the same way as the old face | New edges; you select the new face yourself |
+| **Snapping** | Only to what you can see (unless X-ray), and Merge Distance catches near-misses | Snaps to what's under the cursor |
+| **Workflow** | Pairs with Face Projection: **Align View** to a face, then **Draw on Face** on it | Works from any view |
+
+**Where the Knife tool is better:**
+
+- **Cutting across several faces** in one go. Draw on Face works on one
+  face at a time, and the shape has to stay inside it.
+- **Open cuts**: a single line from one edge to another. Draw on Face
+  always makes a closed shape.
+- **Cut Through** (`Z`): cutting the back side of the mesh too.
+- **Arbitrary paths** that follow a curved surface.
+
+**In short:** use **Draw on Face** for clean, exact shapes inside one
+flat face (panels, windows, insets, logos, screw holes) where you want
+control over the faces around them. Use the **Knife** for freeform cuts
+across the mesh.
+
 ### Drawing plane
 
 | Plane | Description |
