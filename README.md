@@ -1,3 +1,9 @@
+# To Install
+
+Download (`vertex_tools.py`) and Edit > Preferences > Addon > Install From Disk. 
+
+---
+
 # Vertex Tools
 
 A Blender add-on with three point-by-point modeling tools, bundled in one
