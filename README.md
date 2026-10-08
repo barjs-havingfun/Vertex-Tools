@@ -1,16 +1,33 @@
 # Vertex Tools
 
 A Blender add-on with three point-by-point modeling tools, bundled in one
-file (`vertex_tools.py`) and shown together in the sidebar under
-**N Panel > Tool > Vertex Tools**:
+file (`vertex_tools.py`) and shown in their own sidebar tab,
+**N Panel > Vertex Tools**, or in a menu with **`Shift+Q`** (Edit Mode).
+Each tool is a collapsible panel, so you can fold away the ones you're
+not using:
 
-- **Average Vertex**: fix or extend a chain of vertices. Snap a misplaced
-  point into line with its neighbors, or extrude a new point that
-  continues the pattern.
-- **Draw With Vertex**: click points in the viewport to build a face on a
-  plane, with grid, vertex, edge and angle snapping.
+- **Average Vertex**: fix or extend a chain of vertices along a line,
+  curve or circle. Snap a misplaced point into place, straighten a whole
+  chain, or extrude new points that continue the pattern, with a ghost
+  preview before you apply.
+- **Draw With Vertex**: click points, rectangles or circles in the
+  viewport to build faces or edges, on a plane or right on a surface, with
+  grid, vertex, edge and angle snapping.
 - **Face Projection**: turn the view to look straight at any plane you
-  select (3 vertices, 2 edges or a face).
+  select (3 vertices, 2 edges or a face), flatten a selection onto its
+  plane, and draw on it.
+
+---
+
+## Shift+Q menu
+
+In Edit Mode, press **`Shift+Q`** to open the Vertex Tools menu with all
+actions in three columns (Average Vertex, Draw With Vertex, Face
+Projection). `Shift+Q` is unused in Blender's default Edit Mode keymap.
+To change it: `Edit > Preferences > Keymap`, search for
+`VIEW3D_MT_vertex_tools` (under 3D View > Mesh).
+
+The menu is also in `Vertex` menu > `Vertex Tools`.
 
 ---
 
@@ -22,80 +39,91 @@ When you're placing vertices one by one along a path (a profile, a spline
 guide, a row of screw holes, anything laid out point by point), it's easy
 for one point to end up slightly off — not quite on the line, not quite
 evenly spaced. Nudging it by eye is tedious and imprecise. This tool does
-the math for you: fit a line or curve through the *other* selected
-points, then place the **last selected vertex** relative to that fit.
+the math for you: fit a line, curve or circle through the selected
+points, then place the vertices relative to that fit.
+
+### Fit types
+
+| Fit | Use it for |
+|---|---|
+| Line | Straight rows |
+| Curve | Free-form bends: a polynomial (arc / S-curve, adjustable degree) |
+| Circle | Round things: arcs, bolt circles, rims. A true circle, so the radius stays constant |
 
 ### Fix Selected Vertex
 
 Select your reference vertices one by one (click, not box-select — the
 order matters), then click one more vertex last: that's the one that gets
-moved. Five ways to place it:
+moved.
 
-- **Smart: Average Distance** — Fits a straight line through the
-  reference points. If the target sits beyond either end of the chain, it
-  is placed one average inter-point spacing further out. If it sits
-  between two neighbors, it is placed exactly halfway between them.
-- **Smart: Keep Distance** — Same line fit, but the target's position
-  *along* the line is left untouched; only its perpendicular offset is
-  corrected. Use this when a point is already roughly the right distance
-  along the chain but has drifted sideways.
-- **Curve: Average Distance** — Like Smart, but fits a polynomial curve
-  (arc / S-curve, adjustable degree) through the reference points instead
-  of a straight line. Needs at least 3 reference points.
-- **Curve: Keep Distance** — The curve equivalent of Keep Distance: snaps
-  the point onto the fitted curve without changing its position along it.
-- **Move to Average** — Simplest option: places the target at the
-  centroid of all reference points.
+- **Smart / Curve / Circle: Average Distance** — fits a line, curve or
+  circle through the reference points. If the target sits beyond either
+  end of the chain, it is placed one average spacing (or, for circles,
+  one average angle step) further out. If it sits between two neighbors,
+  it is placed exactly halfway between them.
+- **Smart / Curve / Circle: Keep Distance** — same fit, but the target's
+  position *along* it is left untouched; it is only snapped onto the
+  line, curve or circle. Use this when a point is roughly the right
+  distance along but has drifted sideways.
+- **Move to Average** — places the target at the centroid of all
+  reference points.
 
 ### Fix Whole Chain
 
-Straighten or smooth a whole chain in one click instead of fixing points
-one at a time. Select the chain either by clicking the vertices in order,
-or by selecting one connected path of edges (box select works for that).
+Straighten or smooth a whole chain in one click. Select the chain either
+by clicking the vertices in order, or by selecting one connected path of
+edges (box select works for that).
 
-- **Chain: Even Along Line** — fits one straight line through all points
-  and spaces them evenly from the first to the last point.
-- **Chain: Even Along Curve** — fits a curve (adjustable degree) and
-  spaces the points at equal distances along it.
+- **Chain: Even Along Line** — one straight line, points evenly spaced
+  from the first to the last.
+- **Chain: Even Along Curve** — a curve, points at equal distances along
+  it.
+- **Chain: Even Along Arc** — a circle, points at equal angles from the
+  first to the last.
+- **Chain: Full Circle** — a circle, points evenly spaced around the
+  *whole* circle (e.g. 6 points → 60° apart).
 
-In the redo panel (bottom left), switch **Placement** to
-`Keep Distance` to only snap each point onto the line/curve without
-changing the spacing.
+In the redo panel (bottom left), set **Placement** to `Keep Distance` to
+only snap each point onto the fit without changing the spacing.
 
 ### Extrude New Vertex
 
-No target vertex needed — select the chain (in order), pick a direction,
-and a brand-new vertex is created past the last selected point, connected
-by an edge, with the spacing/curvature inferred from the rest of the
-chain.
+Select the chain (in order) and new vertices are created past the last
+selected point, connected by edges, with the spacing / curvature taken
+from the chain.
 
-- **Extrude Along Line** — continues the straight-line fit.
-- **Extrude Along Curve** — continues the fitted curve (needs 3+ points).
+- **Extrude Along Line / Curve / Circle**.
+- **Count** (redo panel) — add several points in one go.
 
-The new vertex is automatically selected and added to the selection
-history, so pressing the operator again (or `Shift+R` to repeat) keeps
-extending the chain one point at a time.
+The new vertices are selected and added to the selection history, so
+running it again (or `Shift+R` to repeat) keeps extending the chain.
+
+### Preview & Apply
+
+The **Preview & Apply** subpanel (inside Average Vertex, collapsed by
+default — click its header to open it) lets you look before you change
+anything:
+
+1. Pick the **action** (any Fix / Whole Chain / Extrude action, or
+   Flatten to Plane) and its options.
+2. Press **Preview**: ghost points (cyan) show where the vertices would
+   go, with lines from their current position. Extruded points show as a
+   ghost chain. The ghosts update live while you change the options.
+3. Press **Apply** to do it, or cancel the preview: the button turns into
+   **Cancel**, or press `Esc`, or click anywhere outside the sidebar.
+
+If the selection doesn't fit the action, the reason is shown under the
+buttons.
 
 ### Options
 
 | Property | Applies to | Description |
 |---|---|---|
-| Placement | Smart / Curve fix / Whole Chain | `Average Distance` vs `Keep Distance` |
-| Curve Degree | Curve modes / Whole Chain | 1 = line, 2 = arc, 3 = S-curve (capped at points − 1) |
+| Placement | Fix / Whole Chain | `Average / Even Spacing`, `Keep Distance`, or `Full Circle` (whole chain + circle only) |
+| Curve Degree | Curve fits | 1 = line, 2 = arc, 3 = S-curve (capped at points − 1) |
 | Spacing Scale | Average Distance / Extrude | Multiplier on the computed spacing |
-| Window | All modes | Use only the last *N* selected points as reference (0 = use all). Useful for long or curved chains where only the local neighborhood should matter |
-
-### Usage
-
-In Edit Mode, vertex select mode (`1`):
-
-- **Fix a point:** click your reference vertices in order, click the
-  vertex to fix last, then run it from the **Average Vertex** section or
-  the `Vertex` menu.
-- **Fix a whole chain:** click the chain in order (or select its edges),
-  then run Chain: Even Along Line/Curve.
-- **Extend a chain:** click the chain vertices in order, then run
-  Extrude Along Line/Curve. Repeat with `Shift+R` to keep going.
+| Window | Fix / Extrude | Use only the last *N* selected points as reference (0 = use all). Useful for long or curved chains where only the local neighborhood should matter |
+| Count | Extrude | How many new points to add |
 
 All computation happens in world space, so it works correctly across
 object scale and rotation.
@@ -106,11 +134,29 @@ object scale and rotation.
 
 ### What it does
 
-Run **Draw Face By Points** from the **Draw With Vertex** section (or the
-`Mesh` menu), click points in the viewport, and a face is created from
-them. Points are placed on a drawing plane that passes through the 3D
-cursor (and is re-anchored on the first point you click). A live preview
-shows the outline and, optionally, a filled face.
+Press **Draw** in the **Draw With Vertex** section (or use the `Shift+Q`
+menu / `Mesh` menu) and click in the viewport. Points are placed on a
+drawing plane that passes through the 3D cursor (and is re-anchored on
+the first point you click). A live preview shows the outline and,
+optionally, a filled face.
+
+### Shapes
+
+| Shape | How to draw |
+|---|---|
+| Points | Click points one by one, `Enter` to finish (or click the first point to close) |
+| Rectangle | Two clicks: opposite corners. Hold `Ctrl` for 45° diagonals (squares) |
+| Circle | Two clicks: center, then radius. **Sides** sets the number of sides (6 = hexagon), `+` / `-` while drawing |
+
+Rectangles and circles finish by themselves on the second click.
+
+### Result
+
+- **Face** — creates a face.
+- **Edges Only** — creates just vertices and edges: an open path, or a
+  closed loop if you click the first point again. Rectangles and circles
+  become closed edge loops. Handy for profiles you then tidy up with
+  Fix Whole Chain.
 
 ### Drawing plane
 
@@ -118,7 +164,11 @@ shows the outline and, optionally, a filled face.
 |---|---|
 | View | Faces the camera exactly |
 | Nearest Axis | The world axis plane closest to the view direction |
+| Surface | Draws right on the surface under the mouse (any visible object, including the mesh you're editing). Rectangles and circles lie flat on the surface where you first click. **Surface Offset** lifts the points slightly off the surface |
 | X / Y / Z | Locked to the plane perpendicular to that axis (side / front / top) |
+
+The snap options are one row of icon toggles next to **Snap** (grid, vertex, edge,
+merge, and fill preview). Hover an icon to see its name.
 
 ### Snapping
 
@@ -129,19 +179,18 @@ shows the outline and, optionally, a filled face.
   new face connects to it (and to the faces next to it). Vertex snap
   wins over edge snap when both are in range.
 - **Merge** (on by default, `M` to toggle) — a point that sits on an
-  existing vertex or edge is merged with it, so the new face really connects to
-  your mesh (shared vertices and edges, no duplicates stacked on top).
-  This also catches points that land on a vertex through grid or angle
-  snapping, within **Merge Distance**. The cursor turns **blue** when the
-  point will merge. With Merge off, a separate vertex is created on top
-  of the existing one instead.
+  existing vertex or edge is merged with it, so the new face really
+  connects to your mesh (shared vertices and edges, no duplicates stacked
+  on top). This also catches points that land on a vertex through grid or
+  angle snapping, within **Merge Distance**. The cursor turns **blue**
+  when the point will merge. With Merge off, a separate vertex is created
+  on top of the existing one instead.
 - **Snap to Grid** — snaps to a grid on the drawing plane (adjustable
   Grid Size). On axis planes the grid lines up with the world grid.
 - **Ctrl angle snap** — hold `Ctrl` to constrain the direction from the
   last point to the Angle Step (default 45°).
-- Clicking near the **first point** closes the shape and creates the face.
 
-The new face is oriented so its normal points toward the viewer.
+New faces are oriented so their normal points toward the viewer.
 
 ### Controls while drawing
 
@@ -149,14 +198,18 @@ The new face is oriented so its normal points toward the viewer.
 |---|---|
 | `LMB` | Add a point (click the first point to close) |
 | `Ctrl` (hold) | Angle snap |
+| `R` / `C` | Rectangle / Circle shape (press again for Points) |
+| `+` / `-` | More / fewer circle sides |
+| `P` | Toggle Edges Only (path) |
 | `X` / `Y` / `Z` | Lock the plane to that axis (press again to return to View) |
+| `S` | Surface plane (press again to return to View) |
 | `G` | Toggle grid snap |
 | `V` | Toggle vertex snap |
 | `E` | Toggle edge snap |
 | `M` | Toggle merge |
 | `F` | Toggle fill preview |
 | `Backspace` / `Ctrl+Z` | Remove the last point |
-| `Enter` / `Space` / `RMB` | Finish and create the face |
+| `Enter` / `Space` / `RMB` | Finish |
 | `Esc` | Cancel |
 | `MMB` / wheel | Orbit, pan and zoom as usual (the plane stays fixed) |
 
@@ -183,9 +236,16 @@ Points that are all on one line don't define a plane and give an error.
 
 - **Align View to Selection** — aligns, centers the view on the selection
   and switches to orthographic.
-- **Align View + Cursor (Draw)** — the same, and also moves and rotates
-  the 3D cursor onto the plane. Then run **Draw With Vertex** with the
-  **View** plane to draw new faces exactly on that slanted plane.
+- **Align View + Cursor** — the same, and also moves and rotates the 3D
+  cursor onto the plane.
+- **Align + Draw** — aligns, puts the cursor on the plane and starts
+  **Draw With Vertex** on it right away, so you can draw exactly on a
+  slanted plane in one click.
+- **Back to Previous View** — returns to the view you had before
+  aligning (it remembers several steps).
+- **Flatten to Plane** — moves all selected vertices onto the best-fit
+  plane of the selection. Great for fixing slightly wonky faces. Also
+  available as a Preview & Apply action.
 
 ### Options (redo panel, bottom left)
 
@@ -207,15 +267,16 @@ looking from.
 1. If you installed the older separate add-ons (`Move Last Vertex to
    Average` or `Draw With Vertex`), disable and remove them first. They
    register the same operators and would clash.
-2. `Edit > Preferences > Add-ons > Install...`, pick `vertex_tools.py`.
+2. `Edit > Preferences > Add-ons > Install...` (Blender 4.2+: `⌄` menu >
+   `Install from Disk...`), pick `vertex_tools.py`.
 3. Enable **Vertex Tools**.
-4. In Edit Mode, press `N` and open the `Tool` tab: you'll find the
-   **Vertex Tools** panel with the **Average Vertex**, **Draw With
-   Vertex** and **Face Projection** sections.
+4. In Edit Mode, press `N` and open the **Vertex Tools** tab: you'll
+   find the **Average Vertex**, **Draw With Vertex** and **Face
+   Projection** panels. Or press `Shift+Q`.
 
 ## Requirements
 
-- Blender 3.0+ (also works with Blender 4.x)
+- Blender 3.0+ (tested with Blender 5.2)
 - NumPy (bundled with Blender's Python)
 
 ## License
