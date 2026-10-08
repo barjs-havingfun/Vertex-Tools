@@ -23,8 +23,7 @@ not using:
 
 In Edit Mode, press **`Shift+Q`** to open the Vertex Tools menu with all
 actions in three columns (Average Vertex, Draw With Vertex, Face
-Projection). `Shift+Q` is unused in Blender's default Edit Mode keymap.
-To change it: `Edit > Preferences > Keymap`, search for
+Projection). To change it: `Edit > Preferences > Keymap`, search for
 `VIEW3D_MT_vertex_tools` (under 3D View > Mesh).
 
 The menu is also in `Vertex` menu > `Vertex Tools`.
