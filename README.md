@@ -158,6 +158,45 @@ Rectangles and circles finish by themselves on the second click.
   become closed edge loops. Handy for profiles you then tidy up with
   Fix Whole Chain.
 
+### Draw on Face
+
+**Draw on Face** (under **Draw**) draws a shape *into* an existing face,
+flat on its plane. Handy together with Face Projection: align the view to
+a face, then draw on it.
+
+1. Press **Draw on Face** and click on a face of the mesh you're editing.
+   That face is outlined in blue and everything you draw stays flat on
+   its plane. Clicking on empty space gives an error: use **Draw** for
+   that.
+2. Draw as usual: Points, Rectangle or Circle, with all the snapping. With
+   **Merge** on, points snapped to the face's corners or edges are shared
+   with it, so e.g. a square in the corner of the face shares its edges
+   with the rest of the face.
+3. Finish, then pick the **Face Method** in the panel at the bottom left
+   (it re-applies instantly):
+
+| Face Method | Result |
+|---|---|
+| **Cut In** (default) | The shape becomes its own face, cut into the face. The rest of the face stays filled. A shape floating inside gets 2 connecting edges (a face can't have a hole); a shape touching the face's edge needs none |
+| **Replace (leave gap)** | The shape becomes a face and the rest of the old face is removed. Its outline edges stay, so you can fill the gap yourself (e.g. `Edge > Bridge Edge Loops`) |
+| **Auto-Bridge** | The shape becomes a face and the ring around it is filled. Every point is connected to its *nearest* points on the other outline (no long faces reaching to far corners), and triangles are joined into quads where they make good quads (e.g. a square in a square gives 4 clean quads). A shape touching the face's edge is cut in instead |
+
+**Auto-Bridge options** (shown in the same bottom-left panel when
+Auto-Bridge is picked, they re-apply instantly):
+
+| Option | What it does |
+|---|---|
+| **Attach Mode** | `Nearest` (default): of all ways to connect the two outlines, the one with the shortest connections. `Even`: connections spread evenly around both outlines, nice when one has many more points (a circle in a square). `Blender Bridge`: Blender's own Bridge Edge Loops |
+| **Twist** (slider) | Rotates which points connect to which. `Nearest` connects as if the shape were turned by that many steps; `Even` and `Blender Bridge` shift the starting pair |
+| **Quad Angle** (slider) | How willing it is to join triangles into quads. Higher = more quads (even bent ones), `0°` = triangles only |
+
+Every result is checked: if a mode or twist would make overlapping
+faces, it falls back to Twist 0 (then the other modes) and the message
+at the bottom tells you what was used.
+
+The shape has to stay inside the face; if it goes outside, nothing is
+changed and you get a message. New faces keep the old face's direction.
+
 ### Drawing plane
 
 | Plane | Description |
@@ -172,6 +211,9 @@ merge, and fill preview). Hover an icon to see its name.
 
 ### Snapping
 
+- **Only what you can see** — vertex and edge snapping ignore anything
+  hidden behind geometry (the edited mesh or other objects). Turn on
+  X-ray (`Alt+Z`, works while drawing) to snap to hidden parts too.
 - **Snap to Vertices** — snaps the cursor to existing mesh vertices.
 - **Snap to Edges** (`E` to toggle) — snaps onto an existing edge, the
   edge is highlighted pink. Near the middle of the edge it snaps exactly
@@ -211,6 +253,7 @@ New faces are oriented so their normal points toward the viewer.
 | `Backspace` / `Ctrl+Z` | Remove the last point |
 | `Enter` / `Space` / `RMB` | Finish |
 | `Esc` | Cancel |
+| `Alt+Z` | Toggle X-ray (snap to hidden vertices / edges too) |
 | `MMB` / wheel | Orbit, pan and zoom as usual (the plane stays fixed) |
 
 ---

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Vertex Tools",
     "author": "Baris",
-    "version": (3, 1, 0),
+    "version": (3, 3, 0),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Edit Mode > N Panel > Vertex Tools tab, Shift+Q menu, and Vertex / Mesh menus",
     "description": "Average Vertex: fix or extend a chain of vertices (line, curve, circle or average). "
@@ -19,6 +19,7 @@ import numpy as np
 from gpu_extras.batch import batch_for_shader
 from bpy_extras import view3d_utils
 from mathutils import Matrix, Vector, geometry, kdtree
+from mathutils.bvhtree import BVHTree
 
 
 # ############################################################################
@@ -962,6 +963,44 @@ def _dist_to_segment(p, a, b):
     return (p - a.lerp(b, min(max(t, 0.0), 1.0))).length
 
 
+def _lookup_merged(bm, point_vidx, point_edge, use_merge):
+    """Existing vertices / edges the points merge with. Look them up before creating anything:
+    creating or splitting invalidates the lookup tables."""
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    if use_merge:
+        merged = [i for i in point_vidx if i is not None]
+        if len(merged) != len(set(merged)):
+            raise ValueError("two points merge into the same vertex")
+    verts = [bm.verts[i] if use_merge and i is not None else None for i in point_vidx]
+    edges = [bm.edges[i] if use_merge and i is not None else None for i in point_edge]
+    return verts, edges
+
+
+def _make_verts(bm, points_local, verts, edges):
+    """Fill in `verts`: split snapped edges at their points (so the new vertex is shared with
+    the edge and its faces), and create the remaining points as new vertices."""
+    pieces = {}  # original edge -> its pieces after splitting (several points on one edge)
+    for i, e in enumerate(edges):
+        if e is None:
+            continue
+        co = points_local[i]
+        parts = pieces.setdefault(e, [e])
+        part = min(parts, key=lambda pe: _dist_to_segment(co, pe.verts[0].co, pe.verts[1].co))
+        v0 = part.verts[0]
+        length = part.calc_length()
+        fac = (co - v0.co).length / length if length > 0.0 else 0.5
+        new_edge, new_vert = bmesh.utils.edge_split(part, v0, min(max(fac, 0.0), 1.0))
+        new_vert.co = co
+        parts.append(new_edge)
+        verts[i] = new_vert
+
+    for i, co in enumerate(points_local):
+        if verts[i] is None:
+            verts[i] = bm.verts.new(co)
+    return verts
+
+
 # ---------------------------------------------------------------------------
 # Drawing
 # ---------------------------------------------------------------------------
@@ -1006,6 +1045,15 @@ def _draw_callback(op, context):
         closing_alpha = 1.0 if closing == 'SOLID' else 0.35
         _draw(shader, 'LINES', [outline[-1], outline[0]], (1.0, 0.6, 0.1, closing_alpha))
 
+    # Draw on Face: outline of the face being drawn on
+    target = getattr(op, "target_outline", None)
+    if target:
+        gpu.state.line_width_set(2.0)
+        lines = []
+        for i in range(len(target)):
+            lines += [target[i], target[(i + 1) % len(target)]]
+        _draw(shader, 'LINES', lines, (0.3, 0.8, 1.0, 0.8))
+
     # Highlight the edge the cursor is snapped to
     if op.hover is not None and op.hover_edge_co is not None:
         gpu.state.line_width_set(3.0)
@@ -1038,20 +1086,8 @@ def _keep_items(items):
     return (('KEEP', "Current", "Use the current setting"),) + tuple(items)
 
 
-class MESH_OT_draw_face_by_points(bpy.types.Operator):
-    """Click points, a rectangle or a circle on a plane or surface, then press Enter
-    to create a face (or edges) from them"""
-    bl_idname = "mesh.draw_face_by_points"
-    bl_label = "Draw With Vertex"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    # Optional overrides (menu entries like "Draw Rectangle"); KEEP = use the panel setting
-    shape: bpy.props.EnumProperty(items=_keep_items(SHAPE_ITEMS), default='KEEP',
-                                  options={'HIDDEN', 'SKIP_SAVE'})
-    plane: bpy.props.EnumProperty(items=_keep_items(PLANE_ITEMS), default='KEEP',
-                                  options={'HIDDEN', 'SKIP_SAVE'})
-    result: bpy.props.EnumProperty(items=_keep_items(RESULT_ITEMS), default='KEEP',
-                                   options={'HIDDEN', 'SKIP_SAVE'})
+class _DrawBase:
+    """Shared modal drawing of Draw With Vertex and Draw on Face."""
 
     @classmethod
     def poll(cls, context):
@@ -1195,26 +1231,78 @@ class MESH_OT_draw_face_by_points(bpy.types.Operator):
             normal = -normal  # the side facing the viewer
         return loc + normal * _settings(context).surface_offset, normal
 
-    def _nearest_screen_point(self, candidates):
-        """Return (index, world_co) of the candidate closest to the mouse within the snap radius."""
+    def _xray(self):
+        shading = self.space.shading
+        return shading.show_xray_wireframe if shading.type == 'WIREFRAME' else shading.show_xray
+
+    def _visible(self, context, co):
+        """Can the viewer see this point, or is it hidden behind geometry? Always True in X-ray."""
+        if self._xray():
+            return True
+        p2d = view3d_utils.location_3d_to_region_2d(self.region, self.rv3d, co)
+        if p2d is None:
+            return False
+        eye = view3d_utils.region_2d_to_origin_3d(self.region, self.rv3d, p2d)
+        to_eye = eye - co
+        dist = to_eye.length
+        if dist < 1e-9:
+            return True
+        d = to_eye / dist
+        eps = max(self.rv3d.view_distance * 1e-5, 1e-6)
+
+        # The edited mesh (as it is in edit mode, visible faces only)
+        if self.bvh is not None and self.bvh.ray_cast(co + d * eps, d, dist)[0] is not None:
+            return False
+
+        # Other objects (hits on the edited object itself are skipped, the check above covers it)
+        origin, remaining = co + d * eps, dist
+        for _ in range(8):
+            hit, loc, _n, _i, obj, _m = context.scene.ray_cast(self.depsgraph, origin, d, distance=remaining)
+            if not hit:
+                return True
+            if obj.name != context.edit_object.name:
+                return False
+            remaining -= (loc - origin).length + eps
+            origin = loc + d * eps
+            if remaining <= 0.0:
+                return True
+        return True
+
+    def _nearest_screen_point(self, context, candidates, check_visible=True):
+        """Return (index, world_co) of the visible candidate closest to the mouse within the snap radius."""
         mouse = Vector(self.mouse)
-        best, best_d = None, SNAP_RADIUS_PX
+        near = []
         for key, co in candidates:
             p2d = view3d_utils.location_3d_to_region_2d(self.region, self.rv3d, co)
             if p2d is None:
                 continue
             d = (p2d - mouse).length
-            if d < best_d:
-                best, best_d = (key, co), d
-        return best
+            if d < SNAP_RADIUS_PX:
+                near.append((d, key, co))
+        for _, key, co in sorted(near, key=lambda c: c[0]):
+            if not check_visible or self._visible(context, co):
+                return key, co
+        return None
 
-    def _nearest_edge(self):
-        """Return (edge_index, (a, b), world_co) of the edge closest to the mouse within the
+    def _edge_point(self, a, b, t):
+        """The snap point on edge a-b: its midpoint when the mouse is near it, else the point under the mouse."""
+        mid = (a + b) / 2
+        mid2d = view3d_utils.location_3d_to_region_2d(self.region, self.rv3d, mid)
+        if mid2d is not None and (mid2d - Vector(self.mouse)).length < SNAP_RADIUS_PX:
+            return mid
+        # Exact 3D point on the edge under the mouse ray (screen t is off in perspective)
+        origin, direction = self._ray()
+        hit = geometry.intersect_line_line(origin, origin + direction, a, b)
+        if hit is not None:
+            t = geometry.intersect_point_line(hit[1], a, b)[1]
+        return a.lerp(b, min(max(t, 0.0), 1.0))
+
+    def _nearest_edge(self, context):
+        """Return (edge_index, (a, b), world_co) of the visible edge closest to the mouse within the
         snap radius, or None. Snaps to the edge midpoint when the mouse is near it."""
         region, rv3d = self.region, self.rv3d
-        mouse2d = Vector(self.mouse)
-        mouse = mouse2d.to_3d()
-        best, best_d = None, SNAP_RADIUS_PX
+        mouse = Vector(self.mouse).to_3d()
+        near = []
         for key, a, b in self.mesh_edges:
             a2d = view3d_utils.location_3d_to_region_2d(region, rv3d, a)
             b2d = view3d_utils.location_3d_to_region_2d(region, rv3d, b)
@@ -1224,29 +1312,33 @@ class MESH_OT_draw_face_by_points(bpy.types.Operator):
             if not 0.0 <= t <= 1.0:
                 continue
             d = (closest - mouse).length
-            if d < best_d:
-                best, best_d = (key, a, b, t), d
-        if best is None:
-            return None
-
-        key, a, b, t = best
-        mid = (a + b) / 2
-        mid2d = view3d_utils.location_3d_to_region_2d(region, rv3d, mid)
-        if mid2d is not None and (mid2d - mouse2d).length < SNAP_RADIUS_PX:
-            return key, (a, b), mid
-
-        # Exact 3D point on the edge under the mouse ray (screen t is off in perspective)
-        origin, direction = self._ray()
-        hit = geometry.intersect_line_line(origin, origin + direction, a, b)
-        if hit is not None:
-            t = geometry.intersect_point_line(hit[1], a, b)[1]
-        return key, (a, b), a.lerp(b, min(max(t, 0.0), 1.0))
+            if d < SNAP_RADIUS_PX:
+                near.append((d, key, a, b, t))
+        for _, key, a, b, t in sorted(near, key=lambda c: c[0]):
+            p = self._edge_point(a, b, t)
+            if self._visible(context, p):
+                return key, (a, b), p
+        return None
 
     def _snap_grid_2d(self, p, grid):
         d = p - self.grid_origin
         u = round(d.dot(self.plane_u) / grid) * grid
         v = round(d.dot(self.plane_v) / grid) * grid
         return self.grid_origin + self.plane_u * u + self.plane_v * v
+
+    def _surface_hit(self, context):
+        """Surface plane: every point for Points, the first click for shapes (the rest stays on its plane)."""
+        s = _settings(context)
+        if s.plane_mode == 'SURFACE' and (s.shape == 'POINTS' or not self.points):
+            return self._raycast(context)
+        return None
+
+    def _accept_point(self, context):
+        """Last check before a clicked point is added (Draw on Face: is there a face)."""
+        return True
+
+    def _title(self):
+        return "Draw"
 
     def _update_hover(self, context, ctrl):
         s = _settings(context)
@@ -1260,33 +1352,31 @@ class MESH_OT_draw_face_by_points(bpy.types.Operator):
 
         # Clicking near the first point closes the shape
         if s.shape == 'POINTS' and len(self.points) >= 3:
-            if self._nearest_screen_point([(0, self.points[0])]):
+            if self._nearest_screen_point(context, [(0, self.points[0])], check_visible=False):
                 self.hover = self.points[0]
                 self.hover_snapped = True
                 self.hover_closes = True
                 return
 
         if s.use_vertex_snap:
-            hit = self._nearest_screen_point(self.mesh_verts)
+            hit = self._nearest_screen_point(context, self.mesh_verts)
             if hit:
                 self.hover_vidx, self.hover = hit
                 self.hover_snapped = True
                 return
 
         if s.use_edge_snap:
-            hit = self._nearest_edge()
+            hit = self._nearest_edge(context)
             if hit:
                 self.hover_edge, self.hover_edge_co, self.hover = hit
                 self.hover_snapped = True
                 return
 
         p = None
-        # Surface: every point for Points, the first click for shapes (the rest stays on its plane)
-        if s.plane_mode == 'SURFACE' and (s.shape == 'POINTS' or not self.points):
-            hit = self._raycast(context)
-            if hit:
-                p, self.hover_normal = hit
-                self.hover_on_surface = True
+        hit = self._surface_hit(context)
+        if hit:
+            p, self.hover_normal = hit
+            self.hover_on_surface = True
 
         if p is None:
             p = self._mouse_to_plane()
@@ -1329,7 +1419,7 @@ class MESH_OT_draw_face_by_points(bpy.types.Operator):
         shape = {'POINTS': "Points", 'RECT': "Rectangle", 'CIRCLE': f"Circle ({s.sides} sides, +/-)"}[s.shape]
         result = "Face" if s.result == 'FACE' else "Edges"
         context.area.header_text_set(
-            f"Draw {shape} -> {result}: {len(self.points)} pt | Plane: {self.plane_label} "
+            f"{self._title()} {shape} -> {result}: {len(self.points)} pt | Plane: {self.plane_label} "
             f"[X/Y/Z lock, S surface, again = view] | R rect, C circle | P edges only: "
             f"{on(s.result == 'EDGES')} | G grid: {on(s.use_grid_snap)} | "
             f"V vertex: {on(s.use_vertex_snap)} | E edge: {on(s.use_edge_snap)} | "
@@ -1350,11 +1440,11 @@ class MESH_OT_draw_face_by_points(bpy.types.Operator):
 
     def invoke(self, context, event):
         s = _settings(context)
-        if self.shape != 'KEEP':
+        if getattr(self, "shape", 'KEEP') != 'KEEP':
             s.shape = self.shape
-        if self.plane != 'KEEP':
+        if getattr(self, "plane", 'KEEP') != 'KEEP':
             s.plane_mode = self.plane
-        if self.result != 'KEEP':
+        if getattr(self, "result", 'KEEP') != 'KEEP':
             s.result = self.result
 
         self.region = self._view_region(context, event)
@@ -1378,6 +1468,15 @@ class MESH_OT_draw_face_by_points(bpy.types.Operator):
         for i, (_, co) in enumerate(self.mesh_verts):
             self.kd.insert(co, i)
         self.kd.balance()
+
+        # Visible faces of the edited mesh (world space): what hides vertices / edges from snapping,
+        # and what Draw on Face clicks on. face_map: BVH polygon index -> mesh face index
+        bm.faces.index_update()
+        visible = [f for f in bm.faces if not f.hide]
+        self.face_map = [f.index for f in visible]
+        self.bvh = BVHTree.FromPolygons([mw @ v.co for v in bm.verts],
+                                        [[v.index for v in f.verts] for f in visible]) if visible else None
+        self.space = context.area.spaces.active
 
         self._clear_points()
         self.hover = None
@@ -1413,6 +1512,10 @@ class MESH_OT_draw_face_by_points(bpy.types.Operator):
                           'TRACKPADPAN', 'TRACKPADZOOM'}:
             return {'PASS_THROUGH'}
 
+        # Alt+Z (X-ray) and Shift+Alt+Z (overlays) still work while drawing
+        if event.type == 'Z' and event.alt:
+            return {'PASS_THROUGH'}
+
         if event.type == 'MOUSEMOVE':
             self._set_mouse(event)
             self._update_hover(context, event.ctrl)
@@ -1436,6 +1539,8 @@ class MESH_OT_draw_face_by_points(bpy.types.Operator):
                 if (s.use_merge and self.hover_vidx is not None
                         and self.hover_vidx in self.point_vidx):
                     self.report({'WARNING'}, "That vertex is already part of this shape")
+                    return {'RUNNING_MODAL'}
+                if not self._accept_point(context):
                     return {'RUNNING_MODAL'}
                 self.points.append(self.hover.copy())
                 self.point_vidx.append(self.hover_vidx)
@@ -1517,42 +1622,10 @@ class MESH_OT_draw_face_by_points(bpy.types.Operator):
         obj = context.edit_object
         me = obj.data
         bm = bmesh.from_edit_mesh(me)
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
         to_local = obj.matrix_world.inverted()
 
-        use_merge = _settings(context).use_merge
-        if use_merge:
-            merged = [i for i in point_vidx if i is not None]
-            if len(merged) != len(set(merged)):
-                raise ValueError("two points merge into the same vertex")
-
-        # Look up the existing vertices and edges first: creating or splitting
-        # invalidates the lookup tables
-        verts = [bm.verts[vidx] if use_merge and vidx is not None else None
-                 for vidx in point_vidx]
-        edges = [bm.edges[eidx] if use_merge and eidx is not None else None
-                 for eidx in point_edge]
-
-        # Split snapped edges, so the new vertex is shared with the edge (and its faces)
-        pieces = {}  # original edge -> its pieces after splitting (several points on one edge)
-        for i, e in enumerate(edges):
-            if e is None:
-                continue
-            co = to_local @ points[i]
-            parts = pieces.setdefault(e, [e])
-            part = min(parts, key=lambda pe: _dist_to_segment(co, pe.verts[0].co, pe.verts[1].co))
-            v0 = part.verts[0]
-            length = part.calc_length()
-            fac = (co - v0.co).length / length if length > 0.0 else 0.5
-            new_edge, new_vert = bmesh.utils.edge_split(part, v0, min(max(fac, 0.0), 1.0))
-            new_vert.co = co
-            parts.append(new_edge)
-            verts[i] = new_vert
-
-        for i, p in enumerate(points):
-            if verts[i] is None:
-                verts[i] = bm.verts.new(to_local @ p)
+        verts, edges = _lookup_merged(bm, point_vidx, point_edge, _settings(context).use_merge)
+        _make_verts(bm, [to_local @ p for p in points], verts, edges)
 
         for elem in (*bm.verts, *bm.edges, *bm.faces):
             elem.select = False
@@ -1580,6 +1653,430 @@ class MESH_OT_draw_face_by_points(bpy.types.Operator):
             v.select = True
         bm.select_flush(True)
         bmesh.update_edit_mesh(me)
+
+
+class MESH_OT_draw_face_by_points(_DrawBase, bpy.types.Operator):
+    """Click points, a rectangle or a circle on a plane or surface, then press Enter
+    to create a face (or edges) from them"""
+    bl_idname = "mesh.draw_face_by_points"
+    bl_label = "Draw With Vertex"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    # Optional overrides (menu entries like "Draw Rectangle"); KEEP = use the panel setting
+    shape: bpy.props.EnumProperty(items=_keep_items(SHAPE_ITEMS), default='KEEP',
+                                  options={'HIDDEN', 'SKIP_SAVE'})
+    plane: bpy.props.EnumProperty(items=_keep_items(PLANE_ITEMS), default='KEEP',
+                                  options={'HIDDEN', 'SKIP_SAVE'})
+    result: bpy.props.EnumProperty(items=_keep_items(RESULT_ITEMS), default='KEEP',
+                                   options={'HIDDEN', 'SKIP_SAVE'})
+
+
+# ---------------------------------------------------------------------------
+# Draw on Face: the drawn shape is cut into an existing face, flat on its plane
+# ---------------------------------------------------------------------------
+
+FACE_METHOD_ITEMS = [
+    ('CUT', "Cut In",
+     "The shape becomes its own face, cut into the face. The rest of the face stays filled "
+     "(split into n-gons; a shape floating inside gets 2 connecting edges)"),
+    ('REPLACE', "Replace (leave gap)",
+     "The shape becomes a face and the rest of the old face is removed. "
+     "Its outline edges stay, so you can fill the gap yourself (e.g. Bridge Edge Loops)"),
+    ('BRIDGE', "Auto-Bridge",
+     "The shape becomes a face and the ring around it is filled with bridged faces "
+     "(a shape touching the face's edge is cut in instead)"),
+]
+
+
+def _point_in_polygon(p, poly, eps):
+    """2D: is p inside the polygon, or within eps of its outline."""
+    n = len(poly)
+    for i in range(n):
+        if _dist_to_segment(p.to_3d(), poly[i].to_3d(), poly[(i + 1) % n].to_3d()) <= eps:
+            return True
+    inside = False
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        if (a.y > p.y) != (b.y > p.y):
+            if p.x < a.x + (p.y - a.y) * (b.x - a.x) / (b.y - a.y):
+                inside = not inside
+    return inside
+
+
+def _signed_area(poly):
+    return 0.5 * sum(a.x * b.y - b.x * a.y for a, b in zip(poly, poly[1:] + poly[:1]))
+
+
+BRIDGE_MODE_ITEMS = [
+    ('NEAREST', "Nearest",
+     "Every point connects to its closest points on the other outline (shortest connections)"),
+    ('EVEN', "Even",
+     "Connections are spread evenly along both outlines, by position around each outline. "
+     "Good when one outline has many more points (e.g. a circle in a square)"),
+    ('BLENDER', "Blender Bridge", "Blender's own Bridge Edge Loops"),
+]
+
+
+def _join_quads(bm, faces, outer, inner, quad_angle):
+    """Join triangles into quads where they make decent quads; returns the ring faces."""
+    if quad_angle > 0.0:
+        for f in faces:
+            f.normal_update()
+        for v in (*outer, *inner):  # new vertices have no normal yet, joining needs them
+            v.normal_update()
+        bmesh.ops.join_triangles(bm, faces=faces, angle_face_threshold=math.radians(40.0),
+                                 angle_shape_threshold=quad_angle)
+    ring = set(outer) | set(inner)
+    return [f for f in bm.faces if set(f.verts) <= ring and any(v in f.verts for v in inner)]
+
+
+def _stitch_tris(outer, inner, to2d, mode, twist):
+    """
+    Triangles filling the ring between the outer loop and the inner loop (both BMVert lists in
+    loop order). Of all ways to stitch the two loops together without flipping a triangle,
+    takes the best one:
+      NEAREST -> shortest total connections, so points connect to their nearest neighbors
+      EVEN    -> connections spread evenly (by position around each outline)
+    The best starting pair is searched too. `twist` rotates the pairing: Nearest connects as if
+    the inner shape were turned by `twist` steps, Even shifts the starting pair by `twist`.
+    Returns a list of vertex triples, or None if every way would overlap.
+    """
+    o2 = [to2d(v.co) for v in outer]
+    i2 = [to2d(v.co) for v in inner]
+    if (_signed_area(o2) > 0.0) != (_signed_area(i2) > 0.0):  # same winding for both loops
+        inner, i2 = inner[::-1], i2[::-1]
+    sign = 1.0 if _signed_area(o2) > 0.0 else -1.0
+    m, n = len(outer), len(inner)
+    O = [(outer[k % m], o2[k % m]) for k in range(m + 1)]
+
+    def fractions(loop):  # position around the closed outline, 0 .. 1
+        cum = [0.0]
+        for k in range(len(loop) - 1):
+            cum.append(cum[-1] + (loop[k + 1][1] - loop[k][1]).length)
+        return [c / cum[-1] for c in cum] if cum[-1] > 0.0 else [k / (len(loop) - 1) for k in range(len(loop))]
+
+    fo = fractions(O)
+    turn = lambda tri: sign * _signed_area([q for _, q, *_ in tri])
+
+    # Nearest + twist: where the inner points "pretend" to be when picking neighbors
+    center = sum(i2, Vector((0.0, 0.0))) / n
+    rot = Matrix.Rotation(sign * 2.0 * math.pi * twist / n, 2) if mode != 'EVEN' else Matrix.Identity(2)
+    i2_virtual = [center + rot @ (q - center) for q in i2]
+
+    def stitch(i0):
+        """Best stitch when inner point i0 pairs with outer point 0: (cost, triangles)."""
+        I = [(inner[(i0 + k) % n], i2[(i0 + k) % n], i2_virtual[(i0 + k) % n]) for k in range(n + 1)]
+        fi = fractions(I)
+        if mode == 'EVEN':
+            cost = lambda j, i: (fo[j] - fi[i]) ** 2 + 1e-9 * (O[j][1] - I[i][1]).length
+        else:
+            cost = lambda j, i: (O[j][1] - I[i][2]).length
+        inf = float("inf")
+        best = [[inf] * (n + 1) for _ in range(m + 1)]
+        prev = [[None] * (n + 1) for _ in range(m + 1)]
+        best[0][0] = cost(0, 0)
+        for j in range(m + 1):
+            for i in range(n + 1):
+                c = best[j][i]
+                if c == inf:
+                    continue
+                for nj, ni, tri in ((j + 1, i, (O[j], O[min(j + 1, m)], I[i])),
+                                    (j, i + 1, (O[j], I[min(i + 1, n)], I[i]))):
+                    if nj > m or ni > n or turn(tri) <= 1e-12:
+                        continue
+                    nc = c + cost(nj, ni)
+                    if nc < best[nj][ni]:
+                        best[nj][ni] = nc
+                        prev[nj][ni] = (j, i, tri)
+        if best[m][n] == inf:
+            return inf, None
+        tris, j, i = [], m, n
+        while (j, i) != (0, 0):
+            j, i, tri = prev[j][i]
+            tris.append(tri)
+        return best[m][n], tris[::-1]
+
+    base = min(range(n), key=lambda i0: stitch(i0)[0])
+    cost, tris = stitch((base + twist) % n if mode == 'EVEN' else base)
+    if tris is None:
+        return None
+
+    # Every triangle must turn the same way and they must exactly fill the ring
+    areas = [turn(tri) for tri in tris]
+    expected = abs(_signed_area(o2)) - abs(_signed_area(i2))
+    if min(areas) <= 1e-12 or abs(sum(areas) - expected) > 1e-6 * max(expected, 1e-9):
+        return None
+    return [[v for v, *_ in tri] for tri in tris]
+
+
+def _bridge_ring(bm, outer, inner, outline, loop, to2d, mode, twist, quad_angle):
+    """
+    Fill the ring with the chosen Attach Mode and Twist. If that would overlap, falls back to
+    Twist 0, then to the other modes. Returns (faces, (mode, twist) used), or (None, None).
+    """
+    expected = abs(_signed_area([to2d(v.co) for v in outer])) - abs(_signed_area([to2d(v.co) for v in inner]))
+    attempts = [(mode, twist), (mode, 0)] + [(other, 0) for other in ('NEAREST', 'EVEN', 'BLENDER')]
+    tried = set()
+    for m_, tw in attempts:
+        if (m_, tw) in tried:
+            continue
+        tried.add((m_, tw))
+        if m_ == 'BLENDER':
+            ring = bmesh.ops.bridge_loops(bm, edges=outline + loop, twist_offset=tw)['faces']
+            if abs(sum(f.calc_area() for f in ring) - expected) <= 1e-6 * max(expected, 1e-9):
+                return _join_quads(bm, ring, outer, inner, quad_angle), (m_, tw)
+            # Overlapping: remove what the bridge added (its connecting edges and faces)
+            added = {e for f in ring for e in f.edges} - set(outline) - set(loop)
+            bmesh.ops.delete(bm, geom=list(added), context='EDGES')
+        else:
+            tris = _stitch_tris(outer, inner, to2d, m_, tw)
+            if tris is not None:
+                faces = [bm.faces.new(tri) for tri in tris]
+                return _join_quads(bm, faces, outer, inner, quad_angle), (m_, tw)
+    return None, None
+
+
+def _keyhole_edges(bm, face, inner):
+    """Two edges linking a loop floating inside `face` to its outline, so the face can be split
+    around it (a face can't have a hole)."""
+    outer = list(face.verts)
+    a, b = min(((i, o) for i in inner for o in outer), key=lambda io: (io[0].co - io[1].co).length)
+    opp = inner[(inner.index(a) + len(inner) // 2) % len(inner)]
+    c = min((o for o in outer if o is not b), key=lambda o: (opp.co - o.co).length)
+    return [bm.edges.new((a, b)), bm.edges.new((opp, c))]
+
+
+def cut_shape_into_face(obj, points, point_vidx, point_edge, face_index, method, use_merge,
+                        bridge=('NEAREST', 0, math.radians(80.0))):
+    """Cut the closed shape `points` (world space) into face `face_index`. Returns a message."""
+    me = obj.data
+    bm = bmesh.from_edit_mesh(me)
+    to_local = obj.matrix_world.inverted()
+    bm.faces.ensure_lookup_table()
+    if not 0 <= face_index < len(bm.faces):
+        raise ValueError("the face is gone, draw again")
+    face = bm.faces[face_index]
+    face.normal_update()
+    n, c = face.normal.copy(), face.calc_center_median()
+    if n.length < 1e-9:
+        raise ValueError("that face has no area")
+
+    # Everything lies flat on the face's plane
+    loc = [to_local @ p for p in points]
+    loc = [p - n * (p - c).dot(n) for p in loc]
+
+    # The shape has to stay inside the face
+    u = face.verts[1].co - face.verts[0].co
+    u = (u - n * u.dot(n)).normalized()
+    v = n.cross(u)
+    to2d = lambda p: Vector(((p - c).dot(u), (p - c).dot(v)))
+    poly = [to2d(fv.co) for fv in face.verts]
+    eps = 1e-4 * max((a - b).length for a in poly for b in poly) + 1e-6
+    if not all(_point_in_polygon(to2d(p), poly, eps) for p in loc):
+        raise ValueError("the shape goes outside the face. Keep it inside, or use Draw")
+
+    verts, edges = _lookup_merged(bm, point_vidx, point_edge, use_merge)
+    _make_verts(bm, loc, verts, edges)
+
+    loop = []
+    for i in range(len(verts)):
+        e = bm.edges.get((verts[i], verts[(i + 1) % len(verts)]))
+        if e is None:
+            e = bm.edges.new((verts[i], verts[(i + 1) % len(verts)]))
+        loop.append(e)
+
+    # Touching = shares a vertex with the face's outline (merged / split onto it)
+    touching = any(vv in face.verts for vv in verts)
+    note = ""
+    if not touching and method in {'REPLACE', 'BRIDGE'}:
+        outline = list(face.edges)
+        outer = list(face.verts)
+        bmesh.ops.delete(bm, geom=[face], context='FACES_ONLY')
+        made = []
+        if method == 'BRIDGE':
+            # Before the inner face exists, so the ring faces only touch the two loops
+            mode, twist, quad_angle = bridge
+            ring, used = _bridge_ring(bm, outer, verts, outline, loop, to2d, mode, twist, quad_angle)
+            labels = {key: label for key, label, _ in BRIDGE_MODE_ITEMS}
+            if ring is None:
+                note = " (this shape can't be bridged without overlapping, left the gap)"
+                ring = []
+            elif used != (mode, twist):
+                note = (f" ({labels[mode]}, Twist {twist} would overlap: "
+                        f"used {labels[used[0]]}, Twist {used[1]})")
+            made += ring
+        inner = bm.faces.new(verts)
+        made.append(inner)
+    else:
+        if method == 'BRIDGE':
+            note = " (the shape touches the face's edge, so it was cut in)"
+        face_edges = set(face.edges)
+        net = [e for e in loop if e not in face_edges]
+        if not touching:
+            net += _keyhole_edges(bm, face, verts)
+        made = bmesh.utils.face_split_edgenet(face, net)
+        vset = set(verts)
+        inner = next((f for f in made if set(f.verts) == vset), None)
+        if inner is None:
+            raise ValueError("could not cut the shape into the face (does it cross itself?)")
+        if method == 'REPLACE':
+            bmesh.ops.delete(bm, geom=[f for f in made if f is not inner], context='FACES_ONLY')
+            made = [inner]
+
+    # New faces keep the old face's direction
+    for f in made:
+        f.normal_update()
+        if f.normal.dot(n) < 0.0:
+            f.normal_flip()
+
+    for elem in (*bm.verts, *bm.edges, *bm.faces):
+        elem.select = False
+    inner.select = True
+    bm.select_flush(True)
+    bmesh.update_edit_mesh(me)
+    name = {key: label for key, label, _ in FACE_METHOD_ITEMS}[method]
+    return f"Drawn on the face: {name}{note}"
+
+
+class DrawOnFacePoint(bpy.types.PropertyGroup):
+    co: bpy.props.FloatVectorProperty(size=3)
+    vidx: bpy.props.IntProperty(default=-1)
+    eidx: bpy.props.IntProperty(default=-1)
+
+
+class MESH_OT_draw_on_face(_DrawBase, bpy.types.Operator):
+    """Draw on an existing face: the shape is cut into that face, flat on its plane.
+    Choose the Face Method in the bottom-left panel after drawing"""
+    bl_idname = "mesh.draw_on_face"
+    bl_label = "Draw on Face"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    face_method: bpy.props.EnumProperty(name="Face Method", items=FACE_METHOD_ITEMS, default='CUT')
+    bridge_mode: bpy.props.EnumProperty(name="Attach Mode", items=BRIDGE_MODE_ITEMS, default='NEAREST',
+                                        description="Auto-Bridge: how the shape's outline is connected "
+                                                    "to the face's outline")
+    bridge_twist: bpy.props.IntProperty(name="Twist", default=0, soft_min=-12, soft_max=12,
+                                        description="Auto-Bridge: rotate which points pair up")
+    quad_angle: bpy.props.FloatProperty(name="Quad Angle", subtype='ANGLE',
+                                        default=math.radians(80.0), min=0.0, max=math.radians(180.0),
+                                        description="Auto-Bridge: how willing it is to join triangles into "
+                                                    "quads (bigger = more quads, even bent ones; 0 = triangles only)")
+    # What was drawn, kept so the bottom-left panel can redo it with another Face Method
+    stored_points: bpy.props.CollectionProperty(type=DrawOnFacePoint, options={'HIDDEN'})
+    stored_face: bpy.props.IntProperty(default=-1, options={'HIDDEN'})
+    stored_merge: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
+
+    def _title(self):
+        return "Draw on Face"
+
+    def invoke(self, context, event):
+        self.target_face = None
+        self.target_outline = None
+        return super().invoke(context, event)
+
+    def _face_under_mouse(self, context):
+        """(face index, world hit point, world normal) of the edited mesh's visible face under the mouse."""
+        if self.bvh is None:
+            return None
+        origin, direction = self._ray()
+        loc, normal, index, _ = self.bvh.ray_cast(origin, direction)
+        if index is None:
+            return None
+        return self.face_map[index], loc, normal.normalized()
+
+    def _surface_hit(self, context):
+        if self.points:  # after the first click, everything stays on the face's plane
+            return None
+        hit = self._face_under_mouse(context)
+        return (hit[1], hit[2]) if hit else None
+
+    def _accept_point(self, context):
+        if self.points:
+            return True
+        hit = self._face_under_mouse(context)
+        if hit is None:
+            self.report({'ERROR'}, "You are drawing on empty space: click on a face, or use Draw instead")
+            return False
+        obj = context.edit_object
+        mw = obj.matrix_world
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        face = bm.faces[hit[0]]
+        self.target_face = hit[0]
+        self.face_no = (mw.inverted_safe().transposed().to_3x3() @ face.normal).normalized()
+        self.face_co = mw @ face.calc_center_median()
+        self.target_outline = [mw @ fv.co for fv in face.verts]
+        return True
+
+    def _setup_plane(self, context):
+        if self.target_face is None:
+            return super()._setup_plane(context)
+        view_rot = self.rv3d.view_rotation
+        n = self.face_no.copy()
+        if n.dot(view_rot @ Vector((0.0, 0.0, -1.0))) < 0.0:
+            n.negate()  # keep the normal pointing away from the viewer
+        u = view_rot @ Vector((1.0, 0.0, 0.0))
+        u = u - n * u.dot(n)
+        u = u.normalized() if u.length > 1e-6 else n.orthogonal().normalized()
+        self.plane_no, self.plane_u, self.plane_v = n, u, u.cross(n)
+        self.plane_co = self.face_co.copy()
+        self.grid_origin = self.plane_co.copy()
+        self.plane_label = "FACE"
+        for i, p in enumerate(self.points):
+            if not self.point_fixed[i]:
+                self.points[i] = self._project(p)
+
+    def _complete(self, context):
+        self._finish(context)
+        s = _settings(context)
+        if self.target_face is None:
+            self.report({'WARNING'}, "Nothing drawn: click on a face first")
+            return {'CANCELLED'}
+        need = 3 if s.shape == 'POINTS' else 2
+        if len(self.points) < need:
+            self.report({'WARNING'}, f"Need at least {need} points")
+            return {'CANCELLED'}
+        try:
+            pts, vidx, edge, _ = self._final_points(s)
+        except ValueError as e:
+            self.report({'ERROR'}, f"Could not create it: {e}")
+            return {'CANCELLED'}
+
+        self.stored_points.clear()
+        for p, vi, ei in zip(pts, vidx, edge):
+            item = self.stored_points.add()
+            item.co = p
+            item.vidx = -1 if vi is None else vi
+            item.eidx = -1 if ei is None else ei
+        self.stored_face = self.target_face
+        self.stored_merge = s.use_merge
+        return self.execute(context)
+
+    def execute(self, context):
+        if self.stored_face < 0 or len(self.stored_points) < 3:
+            self.report({'ERROR'}, "Start Draw on Face from the Vertex Tools panel or the Shift+Q menu")
+            return {'CANCELLED'}
+        pts = [Vector(item.co) for item in self.stored_points]
+        vidx = [None if item.vidx < 0 else item.vidx for item in self.stored_points]
+        eidx = [None if item.eidx < 0 else item.eidx for item in self.stored_points]
+        try:
+            msg = cut_shape_into_face(context.edit_object, pts, vidx, eidx,
+                                      self.stored_face, self.face_method, self.stored_merge,
+                                      (self.bridge_mode, self.bridge_twist, self.quad_angle))
+        except ValueError as e:
+            self.report({'ERROR'}, f"Could not draw on the face: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "face_method")
+        if self.face_method == 'BRIDGE':
+            col = layout.column(align=True)
+            col.prop(self, "bridge_mode")
+            col.prop(self, "bridge_twist", slider=True)
+            col.prop(self, "quad_angle", slider=True)
 
 
 # ############################################################################
@@ -1907,6 +2404,9 @@ class VIEW3D_PT_draw_with_vertex(_VertexToolsPanel, bpy.types.Panel):
         row = layout.row()
         row.scale_y = 1.3
         row.operator(MESH_OT_draw_face_by_points.bl_idname, text="Draw", icon='GREASEPENCIL')
+        row = layout.row()
+        row.scale_y = 1.3
+        row.operator(MESH_OT_draw_on_face.bl_idname, text="Draw on Face", icon='FACESEL')
 
         layout.label(text="Shape:")
         row = layout.row(align=True)
@@ -2009,6 +2509,7 @@ class VIEW3D_MT_vertex_tools(bpy.types.Menu):
         _op(col, draw_id, "Draw Circle", shape='CIRCLE')
         _op(col, draw_id, "Draw Edges Only (Path)", shape='POINTS', result='EDGES')
         _op(col, draw_id, "Draw on Surface", plane='SURFACE')
+        col.operator(MESH_OT_draw_on_face.bl_idname, text="Draw on Face")
 
         col = row.column()
         col.label(text="Face Projection", icon='VIEW_ORTHO')
@@ -2046,6 +2547,8 @@ classes = (
     MESH_OT_vertex_tools_apply,
     DrawWithVertexSettings,
     MESH_OT_draw_face_by_points,
+    DrawOnFacePoint,
+    MESH_OT_draw_on_face,
     VIEW3D_OT_align_view_to_selection,
     VIEW3D_OT_vertex_tools_view_back,
     VIEW3D_OT_align_and_draw,
