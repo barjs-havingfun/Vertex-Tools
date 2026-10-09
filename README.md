@@ -18,7 +18,8 @@ not using:
   preview before you apply.
 - **Draw With Vertex**: click points, rectangles or circles in the
   viewport to build faces or edges, on a plane or right on a surface, with
-  grid, vertex, edge and angle snapping.
+  grid, vertex, edge and angle snapping. Draw shapes into a face, or pull
+  them into live Boolean cutters / adders.
 - **Face Projection**: turn the view to look straight at any plane you
   select (3 vertices, 2 edges or a face), flatten a selection onto its
   plane, and draw on it.
@@ -235,6 +236,74 @@ flat face (panels, windows, insets, logos, screw holes) where you want
 control over the faces around them. Use the **Knife** for freeform cuts
 across the mesh.
 
+### Draw for Bool
+
+**Draw for Bool** (the **Bool** row under **Draw on Face**: **Auto**,
+**Cut**, **Extrude**) draws a shape on a face, then lets you pull it in or
+out by hand. The shape becomes a separate **cutter object** with a live
+Boolean on your mesh, so you can keep moving and angling it before you
+make it permanent.
+
+1. In Edit Mode, press **Auto**, **Cut** or **Extrude**. First you
+   **pick where to draw** (the header says so, and nothing can be drawn
+   yet). The face under the mouse is highlighted:
+   - **Click a face**: everything you draw stays flat on that face's
+     plane, and unlike Draw on Face the shape **may go past the face's
+     edges**.
+   - **`Space`** (or click empty space): draw on the drawing plane, by
+     default the view plane through the 3D cursor, and pull along the
+     view direction.
+2. Draw as usual (Points, Rectangle or Circle, with all the snapping).
+   To cut / add the same distance to **both sides** of the plane, turn on
+   the **Both Directions** toggle under the Auto / Cut / Extrude buttons
+   first (or press `B` while pulling).
+3. When the shape is finished, **move the mouse to pull it**: the cut / add
+   updates live. You can pull either way in every mode:
+
+| Mode | Push into the surface | Pull out of it |
+|---|---|---|
+| **Auto** | Cuts | Adds |
+| **Cut** | Cuts a pocket | Cuts away anything above the surface |
+| **Extrude** | Fills: e.g. the part of the shape hanging over the face's edge gets filled down | Adds a raised block |
+
+   While pulling:
+
+| Key | Action |
+|---|---|
+| `Tab` | Switch Auto / Cut / Extrude |
+| `B` | **Both Directions**: pull the same distance to both sides of the plane (like a CAD *symmetric* extrude), e.g. a slot cut through a wall from its middle |
+| `A` | Align Snap: hover any vertex of the mesh to pull to exactly its height (green dot + guide line) |
+| `Ctrl` (hold) | Snap the depth to the Grid Size |
+| `LMB` / `Enter` | Done |
+| `RMB` / `Esc` | Cancel (nothing is left behind) |
+
+   If the view looks straight down the face, pull with mouse
+   **up = out**, **down = in**.
+4. The **bottom-left panel** (Adjust Last Operation) then has **Mode**
+   (Auto / Cut / Extrude), the exact **Depth** (+ = out, - = in) and
+   **Both Directions**. Changing them rebuilds the cutter instantly. `B`
+   also flips the panel toggle, so it's remembered for the next Draw for Bool.
+5. After confirming you're in **Edit Mode on the cutter**, with its far
+   cap selected: **`G`** changes the depth, **`S`** tapers the walls into
+   an angled cut, and you can grab any of its edges or vertices. The
+   Boolean updates while you edit.
+
+The **Bool Cutters** panel (shown when the cutter or its mesh is active)
+has:
+
+| Button | What it does |
+|---|---|
+| **Difference / Union / Intersect** | Switch what the cutter does, any time |
+| **Solver** | Boolean solver (`Exact` by default) |
+| **Edit Cutter** | Edit a cutter again (on the mesh: one ✎ button per cutter, plus an eye to hide its effect) |
+| **Back to Mesh** | Leave the cutter and edit your mesh again |
+| **Apply Bool** | Make it permanent and delete the cutter. On a cutter: just that one. On the mesh: **Apply All Bools** |
+
+The cutter is parented to your mesh (it moves with it), shows as a
+wireframe and is hidden in renders. Each Draw for Bool adds a new cutter,
+so you can stack several before applying. The cuts stay visible while
+you're back in Edit Mode on your mesh.
+
 ### Drawing plane
 
 | Plane | Description |
@@ -265,6 +334,14 @@ merge, and fill preview). Hover an icon to see its name.
   angle snapping, within **Merge Distance**. The cursor turns **blue**
   when the point will merge. With Merge off, a separate vertex is created
   on top of the existing one instead.
+- **Align Snap** (on by default, `A` to toggle) — CAD-style tracking.
+  Hover a vertex (it gets a small yellow dot: it's now *tracked*, the last
+  4 are kept), then move away: when the cursor comes level with it, it
+  snaps to **the same height** or **the same side-to-side position** on
+  the drawing plane, with a cyan guide line back to it. Points you've
+  already drawn work the same way without hovering, so you can line up a
+  new point with any earlier one. Near two lines at once it snaps to
+  where they cross. Off while holding `Ctrl` (angle snap wins).
 - **Snap to Grid** — snaps to a grid on the drawing plane (adjustable
   Grid Size). On axis planes the grid lines up with the world grid.
 - **Ctrl angle snap** — hold `Ctrl` to constrain the direction from the
@@ -286,6 +363,7 @@ New faces are oriented so their normal points toward the viewer.
 | `G` | Toggle grid snap |
 | `V` | Toggle vertex snap |
 | `E` | Toggle edge snap |
+| `A` | Toggle Align Snap |
 | `M` | Toggle merge |
 | `F` | Toggle fill preview |
 | `Backspace` / `Ctrl+Z` | Remove the last point |

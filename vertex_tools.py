@@ -1,11 +1,11 @@
 bl_info = {
     "name": "Vertex Tools",
     "author": "Baris",
-    "version": (3, 3, 0),
+    "version": (3, 4, 0),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Edit Mode > N Panel > Vertex Tools tab, Shift+Q menu, and Vertex / Mesh menus",
     "description": "Average Vertex: fix or extend a chain of vertices (line, curve, circle or average). "
-                   "Draw With Vertex: click points, rectangles or circles to build faces or edges. "
+                   "Draw With Vertex: click points, rectangles or circles to build faces or edges, or Boolean cutters. "
                    "Face Projection: look straight at the plane of a selection",
     "category": "Mesh",
 }
@@ -924,6 +924,19 @@ class DrawWithVertexSettings(bpy.types.PropertyGroup):
                     "is split there so the new face connects to it",
         default=True,
     )
+    use_align_snap: bpy.props.BoolProperty(
+        name="Align Snap",
+        description="CAD-style tracking: hover a vertex (or use a point you've drawn), move away, and the "
+                    "cursor lines up with it: same height or same side-to-side position on the plane. "
+                    "Draw for Bool: hover a vertex while pulling to match its height. A while drawing",
+        default=True,
+    )
+    bool_symmetric: bpy.props.BoolProperty(
+        name="Both Directions",
+        description="Draw for Bool: pull the same distance to both sides of the drawing plane "
+                    "(B while pulling)",
+        default=False,
+    )
     use_merge: bpy.props.BoolProperty(
         name="Merge",
         description="Points that sit on an existing vertex are merged with it, so the new face "
@@ -1020,7 +1033,27 @@ def _draw(shader, prim, coords, color, indices=None):
     batch.draw(shader)
 
 
+def _draw_pick_hover(face):
+    """Draw for Bool, pick phase: highlight the face under the mouse."""
+    shader = _uniform_shader()
+    gpu.state.blend_set('ALPHA')
+    gpu.state.depth_test_set('NONE')
+    try:
+        _draw(shader, 'TRIS', face, (0.3, 0.8, 1.0, 0.25), indices=geometry.tessellate_polygon([face]))
+    except Exception:
+        pass
+    gpu.state.line_width_set(2.0)
+    _draw(shader, 'LINES', [q for i in range(len(face)) for q in (face[i], face[(i + 1) % len(face)])],
+          (0.3, 0.8, 1.0, 1.0))
+    gpu.state.line_width_set(1.0)
+    gpu.state.blend_set('NONE')
+
+
 def _draw_callback(op, context):
+    if getattr(op, "pick_phase", False):
+        if op.pick_hover:
+            _draw_pick_hover(op.pick_hover)
+        return
     s = _settings(context)
     outline, closing = op.preview_outline(s)
     pts = list(op.points)
@@ -1053,6 +1086,14 @@ def _draw_callback(op, context):
         for i in range(len(target)):
             lines += [target[i], target[(i + 1) % len(target)]]
         _draw(shader, 'LINES', lines, (0.3, 0.8, 1.0, 0.8))
+
+    # Align Snap: tracked vertices and the guide lines the cursor is lined up on
+    if op.tracked and s.use_align_snap:
+        gpu.state.point_size_set(6.0)
+        _draw(shader, 'POINTS', op.tracked, (1.0, 0.85, 0.2, 0.9))
+    if op.align_guides and op.hover is not None:
+        gpu.state.line_width_set(1.0)
+        _draw(shader, 'LINES', [q for guide in op.align_guides for q in guide], (0.3, 0.9, 1.0, 0.7))
 
     # Highlight the edge the cursor is snapped to
     if op.hover is not None and op.hover_edge_co is not None:
@@ -1254,7 +1295,10 @@ class _DrawBase:
         if self.bvh is not None and self.bvh.ray_cast(co + d * eps, d, dist)[0] is not None:
             return False
 
-        # Other objects (hits on the edited object itself are skipped, the check above covers it)
+        # Other objects (hits on the edited object itself are skipped, the check above covers it).
+        # Draw for Bool pulls in Object Mode with the cutter in the way: only the check above then
+        if context.edit_object is None:
+            return True
         origin, remaining = co + d * eps, dist
         for _ in range(8):
             hit, loc, _n, _i, obj, _m = context.scene.ray_cast(self.depsgraph, origin, d, distance=remaining)
@@ -1320,6 +1364,30 @@ class _DrawBase:
                 return key, (a, b), p
         return None
 
+    def _align(self, p):
+        """Align Snap: line p up with a drawn point / tracked vertex along the plane's axes
+        (same height, same side-to-side position, or both). Fills self.align_guides."""
+        to2d = lambda q: view3d_utils.location_3d_to_region_2d(self.region, self.rv3d, q)
+        p2d = to2d(p)
+        if p2d is None:
+            return p
+        best = {}  # axis the guide line runs along -> (screen distance, reference point)
+        for r in [*self.points, *self.tracked]:
+            r = self._project(r)
+            for key, along in (('U', self.plane_u), ('V', self.plane_v)):
+                q2d = to2d(r + along * (p - r).dot(along))  # p slid onto the line through r
+                if q2d is None:
+                    continue
+                d = (q2d - p2d).length
+                if d < SNAP_RADIUS_PX and d < best.get(key, (math.inf,))[0]:
+                    best[key] = (d, r)
+        if 'U' in best:  # same height as r
+            p = p + self.plane_v * (best['U'][1] - p).dot(self.plane_v)
+        if 'V' in best:  # same side-to-side position as r
+            p = p + self.plane_u * (best['V'][1] - p).dot(self.plane_u)
+        self.align_guides = [(r, p) for _, r in best.values()]
+        return p
+
     def _snap_grid_2d(self, p, grid):
         d = p - self.grid_origin
         u = round(d.dot(self.plane_u) / grid) * grid
@@ -1349,6 +1417,7 @@ class _DrawBase:
         self.hover_snapped = False
         self.hover_closes = False
         self.hover_on_surface = False
+        self.align_guides = []
 
         # Clicking near the first point closes the shape
         if s.shape == 'POINTS' and len(self.points) >= 3:
@@ -1363,6 +1432,9 @@ class _DrawBase:
             if hit:
                 self.hover_vidx, self.hover = hit
                 self.hover_snapped = True
+                # Align Snap: a hovered vertex becomes a tracking point (the last few are kept)
+                if s.use_align_snap and all((t - self.hover).length > 1e-9 for t in self.tracked):
+                    self.tracked = (self.tracked + [self.hover.copy()])[-4:]
                 return
 
         if s.use_edge_snap:
@@ -1400,6 +1472,9 @@ class _DrawBase:
             elif s.use_grid_snap:
                 p = self._snap_grid_2d(p, s.grid_size)
                 self.hover_snapped = True
+            if s.use_align_snap and not ctrl:
+                p = self._align(p)
+                self.hover_snapped = self.hover_snapped or bool(self.align_guides)
 
         # A point that lands on an existing vertex (e.g. via grid snap) sits on it
         if self.mesh_verts:
@@ -1423,6 +1498,7 @@ class _DrawBase:
             f"[X/Y/Z lock, S surface, again = view] | R rect, C circle | P edges only: "
             f"{on(s.result == 'EDGES')} | G grid: {on(s.use_grid_snap)} | "
             f"V vertex: {on(s.use_vertex_snap)} | E edge: {on(s.use_edge_snap)} | "
+            f"A align: {on(s.use_align_snap)} | "
             f"M merge: {on(s.use_merge)} | F fill: {on(s.show_fill)} | "
             "Ctrl: angle | LMB add | Backspace undo | Enter/RMB finish | Esc cancel")
 
@@ -1479,6 +1555,8 @@ class _DrawBase:
         self.space = context.area.spaces.active
 
         self._clear_points()
+        self.tracked = []
+        self.align_guides = []
         self.hover = None
         self.hover_vidx = None
         self.hover_edge = None
@@ -1582,7 +1660,7 @@ class _DrawBase:
             return self._refresh(context, event.ctrl)
 
         toggles = {'G': "use_grid_snap", 'V': "use_vertex_snap", 'E': "use_edge_snap",
-                   'M': "use_merge", 'F': "show_fill"}
+                   'A': "use_align_snap", 'M': "use_merge", 'F': "show_fill"}
         if event.type in toggles:
             setattr(s, toggles[event.type], not getattr(s, toggles[event.type]))
             return self._refresh(context, event.ctrl)
@@ -1944,30 +2022,8 @@ class DrawOnFacePoint(bpy.types.PropertyGroup):
     eidx: bpy.props.IntProperty(default=-1)
 
 
-class MESH_OT_draw_on_face(_DrawBase, bpy.types.Operator):
-    """Draw on an existing face: the shape is cut into that face, flat on its plane.
-    Choose the Face Method in the bottom-left panel after drawing"""
-    bl_idname = "mesh.draw_on_face"
-    bl_label = "Draw on Face"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    face_method: bpy.props.EnumProperty(name="Face Method", items=FACE_METHOD_ITEMS, default='CUT')
-    bridge_mode: bpy.props.EnumProperty(name="Attach Mode", items=BRIDGE_MODE_ITEMS, default='NEAREST',
-                                        description="Auto-Bridge: how the shape's outline is connected "
-                                                    "to the face's outline")
-    bridge_twist: bpy.props.IntProperty(name="Twist", default=0, soft_min=-12, soft_max=12,
-                                        description="Auto-Bridge: rotate which points pair up")
-    quad_angle: bpy.props.FloatProperty(name="Quad Angle", subtype='ANGLE',
-                                        default=math.radians(80.0), min=0.0, max=math.radians(180.0),
-                                        description="Auto-Bridge: how willing it is to join triangles into "
-                                                    "quads (bigger = more quads, even bent ones; 0 = triangles only)")
-    # What was drawn, kept so the bottom-left panel can redo it with another Face Method
-    stored_points: bpy.props.CollectionProperty(type=DrawOnFacePoint, options={'HIDDEN'})
-    stored_face: bpy.props.IntProperty(default=-1, options={'HIDDEN'})
-    stored_merge: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
-
-    def _title(self):
-        return "Draw on Face"
+class _FaceDrawBase(_DrawBase):
+    """Drawing that starts on a face of the edited mesh and stays flat on that face's plane."""
 
     def invoke(self, context, event):
         self.target_face = None
@@ -1990,12 +2046,10 @@ class MESH_OT_draw_on_face(_DrawBase, bpy.types.Operator):
         hit = self._face_under_mouse(context)
         return (hit[1], hit[2]) if hit else None
 
-    def _accept_point(self, context):
-        if self.points:
-            return True
+    def _pick_face(self, context):
+        """First click: lock onto the face under the mouse. False if there is none."""
         hit = self._face_under_mouse(context)
         if hit is None:
-            self.report({'ERROR'}, "You are drawing on empty space: click on a face, or use Draw instead")
             return False
         obj = context.edit_object
         mw = obj.matrix_world
@@ -2025,6 +2079,38 @@ class MESH_OT_draw_on_face(_DrawBase, bpy.types.Operator):
         for i, p in enumerate(self.points):
             if not self.point_fixed[i]:
                 self.points[i] = self._project(p)
+
+
+class MESH_OT_draw_on_face(_FaceDrawBase, bpy.types.Operator):
+    """Draw on an existing face: the shape is cut into that face, flat on its plane.
+    Choose the Face Method in the bottom-left panel after drawing"""
+    bl_idname = "mesh.draw_on_face"
+    bl_label = "Draw on Face"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    face_method: bpy.props.EnumProperty(name="Face Method", items=FACE_METHOD_ITEMS, default='CUT')
+    bridge_mode: bpy.props.EnumProperty(name="Attach Mode", items=BRIDGE_MODE_ITEMS, default='NEAREST',
+                                        description="Auto-Bridge: how the shape's outline is connected "
+                                                    "to the face's outline")
+    bridge_twist: bpy.props.IntProperty(name="Twist", default=0, soft_min=-12, soft_max=12,
+                                        description="Auto-Bridge: rotate which points pair up")
+    quad_angle: bpy.props.FloatProperty(name="Quad Angle", subtype='ANGLE',
+                                        default=math.radians(80.0), min=0.0, max=math.radians(180.0),
+                                        description="Auto-Bridge: how willing it is to join triangles into "
+                                                    "quads (bigger = more quads, even bent ones; 0 = triangles only)")
+    # What was drawn, kept so the bottom-left panel can redo it with another Face Method
+    stored_points: bpy.props.CollectionProperty(type=DrawOnFacePoint, options={'HIDDEN'})
+    stored_face: bpy.props.IntProperty(default=-1, options={'HIDDEN'})
+    stored_merge: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
+
+    def _title(self):
+        return "Draw on Face"
+
+    def _accept_point(self, context):
+        if self.points or self._pick_face(context):
+            return True
+        self.report({'ERROR'}, "You are drawing on empty space: click on a face, or use Draw instead")
+        return False
 
     def _complete(self, context):
         self._finish(context)
@@ -2077,6 +2163,506 @@ class MESH_OT_draw_on_face(_DrawBase, bpy.types.Operator):
             col.prop(self, "bridge_mode")
             col.prop(self, "bridge_twist", slider=True)
             col.prop(self, "quad_angle", slider=True)
+
+
+# ---------------------------------------------------------------------------
+# Draw for Bool: the drawn shape is pulled into a cutter / adder object with a live Boolean
+# ---------------------------------------------------------------------------
+
+BOOL_MODE_ITEMS = (
+    ('AUTO', "Auto", "Push into the surface to cut, pull out of it to add"),
+    ('CUT', "Cut", "Always cuts (Boolean Difference), whichever way you pull"),
+    ('EXTRUDE', "Extrude", "Always adds (Boolean Union), whichever way you pull. "
+                           "Pulling inward fills the part of the shape that hangs over the edge"),
+)
+BOOL_LABELS = {key: label for key, label, _ in BOOL_MODE_ITEMS}
+NAV_EVENTS = {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN', 'TRACKPADZOOM'}
+
+
+def _is_cutter(ob):
+    return ob is not None and bool(ob.get("vt_cutter", False))
+
+
+def _cutter_modifier(cutter):
+    """(part, Boolean modifier) a cutter object belongs to; either can be None."""
+    part = cutter.parent
+    if part is None:
+        return None, None
+    return part, next((m for m in part.modifiers if m.type == 'BOOLEAN' and m.object == cutter), None)
+
+
+def _part_cutters(part):
+    """Boolean modifiers on `part` that use one of our cutter objects."""
+    return [m for m in part.modifiers if m.type == 'BOOLEAN' and _is_cutter(m.object)]
+
+
+def _build_prism(me, outline, z0, z1):
+    """Fill mesh `me` with a closed prism: the 2D `outline` from height z0 to z1 (local Z).
+    The far cap (z1) is selected, so it can be grabbed / scaled right away."""
+    bm = bmesh.new()
+    lo = [bm.verts.new((x, y, z0)) for x, y in outline]
+    hi = [bm.verts.new((x, y, z1)) for x, y in outline]
+    bm.faces.new(lo)
+    cap = bm.faces.new(hi)
+    n = len(outline)
+    for i in range(n):
+        j = (i + 1) % n
+        bm.faces.new((lo[i], lo[j], hi[j], hi[i]))
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    cap.select_set(True)
+    bm.to_mesh(me)
+    bm.free()
+    me.update()
+
+
+def _remove_cutter(cutter):
+    me = cutter.data
+    bpy.data.objects.remove(cutter)
+    if me is not None and me.users == 0:
+        bpy.data.meshes.remove(me)
+
+
+def _edit_only(context, ob):
+    """Leave Edit Mode, then edit only `ob`."""
+    if context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    for other in context.selected_objects:
+        other.select_set(False)
+    ob.hide_set(False)
+    ob.select_set(True)
+    context.view_layer.objects.active = ob
+    bpy.ops.object.mode_set(mode='EDIT')
+
+
+def _depth_draw_callback(op):
+    """Draw for Bool, while pulling: show the vertex the depth is snapped to."""
+    if op.depth_snap is None:
+        return
+    shader = _uniform_shader()
+    gpu.state.blend_set('ALPHA')
+    gpu.state.depth_test_set('NONE')
+    gpu.state.line_width_set(1.5)
+    _draw(shader, 'LINES', [op.depth_c + op.depth_n * op.depth, op.depth_snap], (0.3, 0.9, 1.0, 0.7))
+    gpu.state.point_size_set(12.0)
+    _draw(shader, 'POINTS', [op.depth_snap], (0.2, 1.0, 0.4, 1.0))
+    gpu.state.line_width_set(1.0)
+    gpu.state.point_size_set(1.0)
+    gpu.state.blend_set('NONE')
+
+
+class MESH_OT_draw_for_bool(_FaceDrawBase, bpy.types.Operator):
+    """Draw a shape on a face (or on the view plane through the 3D cursor), then pull it in or out.
+    It becomes a separate cutter object with a live Boolean on your mesh, ready to grab and angle"""
+    bl_idname = "mesh.draw_for_bool"
+    bl_label = "Draw for Bool"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    bool_mode: bpy.props.EnumProperty(name="Mode", items=BOOL_MODE_ITEMS, default='AUTO',
+                                      options={'SKIP_SAVE'})
+    depth: bpy.props.FloatProperty(name="Depth", unit='LENGTH', options={'SKIP_SAVE'},
+                                   description="How far it's pulled: + = out of the surface, - = into it")
+    symmetric: bpy.props.BoolProperty(name="Both Directions",
+                                      description="Pull the same distance to both sides of the drawing "
+                                                  "plane (B while pulling)",
+                                      default=False, options={'SKIP_SAVE'})
+    # What was drawn, kept so the bottom-left panel can rebuild the cutter
+    stored_points: bpy.props.CollectionProperty(type=DrawOnFacePoint, options={'HIDDEN', 'SKIP_SAVE'})
+    stored_matrix: bpy.props.FloatVectorProperty(size=16, options={'HIDDEN', 'SKIP_SAVE'})
+    stored_cutter: bpy.props.StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+
+    @classmethod
+    def poll(cls, context):
+        return super().poll(context) and not _is_cutter(context.edit_object)
+
+    def _title(self):
+        return f"Draw for Bool ({BOOL_LABELS[self.bool_mode]})"
+
+    def invoke(self, context, event):
+        self.depth_phase = False
+        self.symmetric = _settings(context).bool_symmetric
+        # First pick where to draw: a face, or the view plane (nothing can be drawn yet)
+        self.pick_phase = True
+        self.pick_index = None
+        self.pick_hover = None
+        result = super().invoke(context, event)
+        if self.pick_phase:
+            self._update_pick_hover(context)
+            self._update_header(context)
+        return result
+
+    # --- pick phase: a face, or the view plane through the 3D cursor ----------
+
+    def _update_pick_hover(self, context):
+        """Highlight the face under the mouse."""
+        hit = self._face_under_mouse(context)
+        index = hit[0] if hit else None
+        if index == self.pick_index:
+            return
+        self.pick_index = index
+        self.pick_hover = None
+        if index is not None:
+            obj = context.edit_object
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.faces.ensure_lookup_table()
+            self.pick_hover = [obj.matrix_world @ v.co for v in bm.faces[index].verts]
+
+    def _start_drawing(self, context):
+        self.pick_phase = False
+        self.pick_hover = None
+        self._setup_plane(context)
+        self._update_hover(context, False)
+        self._update_header(context)
+        return {'RUNNING_MODAL'}
+
+    def _pick_modal(self, context, event):
+        context.area.tag_redraw()
+        if event.type in NAV_EVENTS or (event.type == 'Z' and event.alt):
+            return {'PASS_THROUGH'}
+        if event.type == 'MOUSEMOVE':
+            self._set_mouse(event)
+            self._update_pick_hover(context)
+            return {'RUNNING_MODAL'}
+        if event.value != 'PRESS':
+            return {'RUNNING_MODAL'}
+        if event.type == 'LEFTMOUSE':
+            self._set_mouse(event)
+            self._pick_face(context)  # empty space: the view plane through the 3D cursor
+            return self._start_drawing(context)
+        if event.type == 'SPACE':
+            return self._start_drawing(context)
+        if event.type in {'ESC', 'RIGHTMOUSE'}:
+            self._finish(context)
+            return {'CANCELLED'}
+        return {'RUNNING_MODAL'}
+
+    def _update_header(self, context):
+        if getattr(self, "pick_phase", False):
+            context.area.header_text_set(
+                f"{self._title()}: click a FACE to cut / add on it, or SPACE (or click empty space) "
+                "for the view plane through the 3D cursor | Esc: cancel")
+        else:
+            super()._update_header(context)
+
+    def _surface_hit(self, context):
+        return None  # the plane was picked already: everything goes on it
+
+    def _accept_point(self, context):
+        return True
+
+    def modal(self, context, event):
+        if self.depth_phase:
+            return self._depth_modal(context, event)
+        if self.pick_phase:
+            return self._pick_modal(context, event)
+        return super().modal(context, event)
+
+    # --- the cutter ------------------------------------------------------------
+
+    def _shape_from_props(self):
+        """Read the outline and placement back from the stored properties."""
+        self.outline = [(item.co[0], item.co[1]) for item in self.stored_points]
+        m = Matrix([self.stored_matrix[i * 4:i * 4 + 4] for i in range(4)])
+        self.depth_c = m.translation.copy()
+        self.depth_u, self.depth_n = m.col[0].to_3d(), m.col[2].to_3d()
+        size = max((Vector(a) - Vector(b)).length for a in self.outline for b in self.outline)
+        self.min_depth = size * 1e-3
+        # The cutter's base is moved a little off the surface, so it doesn't lie exactly on the
+        # face (Booleans can break on overlapping faces)
+        self.overshoot = size * 2e-3
+        return m
+
+    def _create_cutter(self, context, part, matrix):
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        me = bpy.data.meshes.new("VT_Cutter")
+        cutter = bpy.data.objects.new("VT_Cutter", me)
+        (part.users_collection[0] if part.users_collection else context.collection).objects.link(cutter)
+        cutter["vt_cutter"] = True
+        cutter.display_type = 'WIRE'
+        cutter.hide_render = True
+        cutter.parent = part
+        cutter.matrix_parent_inverse = part.matrix_world.inverted()
+        cutter.matrix_basis = matrix
+        mod = part.modifiers.new(name=f"VT {cutter.name}", type='BOOLEAN')
+        mod.object = cutter
+        mod.solver = 'EXACT'
+        mod.show_in_editmode = True  # keep seeing the cut after Back to Mesh
+        self.part, self.cutter, self.mod = part, cutter, mod
+        self.stored_cutter = cutter.name
+
+    def _operation(self, depth):
+        if self.bool_mode == 'AUTO':
+            return 'UNION' if depth > 0.0 else 'DIFFERENCE'
+        return 'DIFFERENCE' if self.bool_mode == 'CUT' else 'UNION'
+
+    def _update_cutter(self):
+        d = self.depth
+        if abs(d) < self.min_depth:
+            d = math.copysign(self.min_depth, 1.0 if self.bool_mode == 'EXTRUDE' else -1.0)
+        op = self._operation(d)
+        if self.symmetric:
+            base = -d  # the same distance to the other side of the plane
+        elif op == 'DIFFERENCE':
+            # A cut starts just outside the surface, an add pulled out starts just inside it,
+            # an add pulled in (filling an overhang) starts flush so nothing sticks out on top
+            base = self.overshoot
+        else:
+            base = -self.overshoot if d > 0.0 else 0.0
+        _build_prism(self.cutter.data, self.outline, base, d)
+        self.mod.operation = op
+        return op, d
+
+    # --- shape done: build the cutter and start pulling ----------------------
+
+    def _complete(self, context):
+        self._finish(context)
+        s = _settings(context)
+        need = 3 if s.shape == 'POINTS' else 2
+        if len(self.points) < need:
+            self.report({'WARNING'}, f"Need at least {need} points")
+            return {'CANCELLED'}
+        try:
+            pts = [self._project(p) for p in self._final_points(s)[0]]
+        except ValueError as e:
+            self.report({'ERROR'}, f"Could not create it: {e}")
+            return {'CANCELLED'}
+        if max((a - b).length for a in pts for b in pts) < 1e-9:
+            self.report({'ERROR'}, "Could not create it: the shape has no size")
+            return {'CANCELLED'}
+
+        # Outward = the face's own normal, else toward the viewer
+        view_dir = self.rv3d.view_rotation @ Vector((0.0, 0.0, -1.0))
+        if self.target_face is not None:
+            n = self.face_no.copy()
+        else:
+            n = -self.plane_no if self.plane_no.dot(view_dir) > 0.0 else self.plane_no.copy()
+        u = self.plane_u.copy()
+        v = n.cross(u)
+        c = sum(pts, Vector()) / len(pts)
+        matrix = Matrix.Translation(c) @ Matrix((u, v, n)).transposed().to_4x4()
+        self.stored_points.clear()
+        for p in pts:
+            self.stored_points.add().co = ((p - c).dot(u), (p - c).dot(v), 0.0)
+        self.stored_matrix = [x for row in matrix for x in row]
+        self._shape_from_props()
+
+        self._create_cutter(context, context.edit_object, matrix)
+        self.depth_phase = True
+        self.depth = 0.0
+        self.raw_depth = 0.0
+        self.last_mouse = None
+        self.depth_snap = None
+        self._depth_handle = bpy.types.SpaceView3D.draw_handler_add(
+            _depth_draw_callback, (self,), 'WINDOW', 'POST_VIEW')
+        self._update_cutter()
+        self._depth_header(context)
+        return {'RUNNING_MODAL'}
+
+    # --- pulling ---------------------------------------------------------------
+
+    def _pull_axis(self):
+        """(screen direction, world length per pixel) for pulling along the outward normal.
+        Looking straight down the normal it can't be seen, so mouse up = out, down = in."""
+        to2d = lambda p: view3d_utils.location_3d_to_region_2d(self.region, self.rv3d, p)
+        step = max(self.rv3d.view_distance * 0.1, 1e-6)
+        c2d = to2d(self.depth_c)
+        n2d = to2d(self.depth_c + self.depth_n * step)
+        u2d = to2d(self.depth_c + self.depth_u * step)
+        if c2d is None or u2d is None or (u2d - c2d).length < 1e-6:
+            return Vector((0.0, 1.0)), 0.01
+        side = (u2d - c2d).length
+        if n2d is not None and (n2d - c2d).length > 0.25 * side:
+            d = n2d - c2d
+            return d.normalized(), step / d.length
+        return Vector((0.0, 1.0)), step / side
+
+    def _set_depth(self, context, ctrl):
+        mouse = Vector(self.mouse)
+        if self.last_mouse is not None:
+            axis, per_px = self._pull_axis()
+            self.raw_depth += (mouse - self.last_mouse).dot(axis) * per_px
+        self.last_mouse = mouse
+        s = _settings(context)
+        depth = self.raw_depth
+        self.depth_snap = None
+        # Align Snap: hover a vertex to pull to exactly its height
+        hit = self._nearest_screen_point(context, self.mesh_verts) if s.use_align_snap else None
+        if hit:
+            self.depth_snap = hit[1]
+            depth = (hit[1] - self.depth_c).dot(self.depth_n)
+        elif ctrl:
+            depth = round(depth / s.grid_size) * s.grid_size
+        self.depth = depth
+        self._update_cutter()
+        self._depth_header(context)
+
+    def _depth_header(self, context):
+        op, d = self._operation(self.depth), self.depth
+        unit = context.scene.unit_settings
+        dist = bpy.utils.units.to_string(unit.system, 'LENGTH', abs(d) * unit.scale_length, precision=4)
+        on = lambda b: "ON" if b else "off"
+        where = "both ways" if self.symmetric else ("out" if d > 0.0 else "in")
+        context.area.header_text_set(
+            f"{self._title()}: {'Cut' if op == 'DIFFERENCE' else 'Add'} {dist} {where}"
+            f"{' (snapped to vertex)' if self.depth_snap is not None else ''} | Move the mouse to pull | "
+            f"Tab: Auto / Cut / Extrude | B both directions: {on(self.symmetric)} | "
+            f"A align to vertex: {on(_settings(context).use_align_snap)} | Ctrl: snap to grid size | "
+            "LMB / Enter: done | RMB / Esc: cancel")
+        context.area.tag_redraw()
+
+    def _end_depth(self, context):
+        bpy.types.SpaceView3D.draw_handler_remove(self._depth_handle, 'WINDOW')
+        context.area.header_text_set(None)
+        context.area.tag_redraw()
+
+    def _depth_modal(self, context, event):
+        if event.type in NAV_EVENTS:
+            self.last_mouse = None  # the view moves: don't turn that into a pull
+            return {'PASS_THROUGH'}
+        if event.type == 'Z' and event.alt:
+            return {'PASS_THROUGH'}
+        if event.type == 'MOUSEMOVE':
+            self._set_mouse(event)
+            self._set_depth(context, event.ctrl)
+            return {'RUNNING_MODAL'}
+        if event.type in {'LEFT_CTRL', 'RIGHT_CTRL'}:
+            self._set_depth(context, event.value == 'PRESS')
+            return {'RUNNING_MODAL'}
+        if event.value != 'PRESS':
+            return {'RUNNING_MODAL'}
+        if event.type in {'TAB', 'B', 'A'}:
+            if event.type == 'TAB':
+                keys = [key for key, *_ in BOOL_MODE_ITEMS]
+                self.bool_mode = keys[(keys.index(self.bool_mode) + 1) % len(keys)]
+            elif event.type == 'B':
+                self.symmetric = not self.symmetric
+                _settings(context).bool_symmetric = self.symmetric  # remembered for next time
+            else:
+                s = _settings(context)
+                s.use_align_snap = not s.use_align_snap
+            self._set_depth(context, event.ctrl)
+            return {'RUNNING_MODAL'}
+        if event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER', 'SPACE'}:
+            self._end_depth(context)
+            # Edit the cutter right away with its far cap selected: G = depth, S = angled walls
+            _edit_only(context, self.cutter)
+            self.report({'INFO'}, "Cutter ready: G moves the selected cap, S angles the walls. "
+                                  "Back to Mesh / Apply Bool in the Vertex Tools panel")
+            return {'FINISHED'}
+        if event.type in {'ESC', 'RIGHTMOUSE'}:
+            self._end_depth(context)
+            self.part.modifiers.remove(self.mod)
+            _remove_cutter(self.cutter)
+            _edit_only(context, self.part)
+            return {'CANCELLED'}
+        return {'RUNNING_MODAL'}
+
+    # --- bottom-left panel -----------------------------------------------------
+
+    def execute(self, context):
+        if len(self.stored_points) < 3:
+            self.report({'ERROR'}, "Start Draw for Bool from the Vertex Tools panel or the Shift+Q menu")
+            return {'CANCELLED'}
+        matrix = self._shape_from_props()
+        # Normally undo has removed the previous cutter; if it's still there, reuse it
+        old = bpy.data.objects.get(self.stored_cutter) if self.stored_cutter else None
+        if _is_cutter(old) and _cutter_modifier(old)[1] is not None:
+            if context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            self.cutter = old
+            self.part, self.mod = _cutter_modifier(old)
+        else:
+            part = context.edit_object
+            if part is None or _is_cutter(part):
+                self.report({'ERROR'}, "Edit the mesh to cut first")
+                return {'CANCELLED'}
+            self._create_cutter(context, part, matrix)
+        self._update_cutter()
+        _edit_only(context, self.cutter)
+        return {'FINISHED'}
+
+    def draw(self, context):
+        layout = self.layout
+        row = layout.row(align=True)
+        row.prop(self, "bool_mode", expand=True)
+        layout.prop(self, "depth")
+        layout.prop(self, "symmetric")
+
+
+class OBJECT_OT_vertex_tools_edit_cutter(bpy.types.Operator):
+    """Edit a cutter object (the live Boolean updates while you move it)"""
+    bl_idname = "object.vertex_tools_edit_cutter"
+    bl_label = "Edit Cutter"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    name: bpy.props.StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None and context.mode in {'OBJECT', 'EDIT_MESH'}
+
+    def execute(self, context):
+        cutter = bpy.data.objects.get(self.name) if self.name else context.active_object
+        if not _is_cutter(cutter):
+            mods = _part_cutters(context.active_object)
+            cutter = mods[-1].object if mods else None
+        if cutter is None:
+            self.report({'ERROR'}, "No cutter found")
+            return {'CANCELLED'}
+        _edit_only(context, cutter)
+        return {'FINISHED'}
+
+
+class OBJECT_OT_vertex_tools_back_to_mesh(bpy.types.Operator):
+    """Leave the cutter and edit the mesh it cuts again"""
+    bl_idname = "object.vertex_tools_back_to_mesh"
+    bl_label = "Back to Mesh"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _is_cutter(context.active_object) and context.active_object.parent is not None
+
+    def execute(self, context):
+        _edit_only(context, context.active_object.parent)
+        return {'FINISHED'}
+
+
+class OBJECT_OT_vertex_tools_apply_bool(bpy.types.Operator):
+    """Make the Boolean permanent and delete the cutter.
+    On a cutter: applies that cutter. On the mesh: applies all its cutters"""
+    bl_idname = "object.vertex_tools_apply_bool"
+    bl_label = "Apply Bool"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and (_is_cutter(ob) or bool(_part_cutters(ob)))
+
+    def execute(self, context):
+        ob = context.active_object
+        if _is_cutter(ob):
+            part, mod = _cutter_modifier(ob)
+            if part is None or mod is None:
+                self.report({'ERROR'}, "This cutter isn't used by a Boolean anymore")
+                return {'CANCELLED'}
+            mods = [mod]
+        else:
+            part, mods = ob, _part_cutters(ob)
+
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        cutters = [m.object for m in mods]
+        with context.temp_override(object=part, active_object=part):
+            for m in mods:
+                bpy.ops.object.modifier_apply(modifier=m.name)
+        for cutter in cutters:
+            if not any(m.type == 'BOOLEAN' and m.object == cutter for m in part.modifiers):
+                _remove_cutter(cutter)
+        _edit_only(context, part)
+        self.report({'INFO'}, f"Applied {len(mods)} Boolean{'s' if len(mods) != 1 else ''}")
+        return {'FINISHED'}
 
 
 # ############################################################################
@@ -2407,6 +2993,14 @@ class VIEW3D_PT_draw_with_vertex(_VertexToolsPanel, bpy.types.Panel):
         row = layout.row()
         row.scale_y = 1.3
         row.operator(MESH_OT_draw_on_face.bl_idname, text="Draw on Face", icon='FACESEL')
+        row = _labeled_row(layout, "Bool", factor=0.2)
+        row.scale_y = 1.3
+        bool_id = MESH_OT_draw_for_bool.bl_idname
+        _op(row, bool_id, "Auto", 'MOD_BOOLEAN', bool_mode='AUTO')
+        _op(row, bool_id, "Cut", 'SELECT_DIFFERENCE', bool_mode='CUT')
+        _op(row, bool_id, "Extrude", 'SELECT_EXTEND', bool_mode='EXTRUDE')
+        row = _labeled_row(layout, "", factor=0.2)
+        row.prop(s, "bool_symmetric", toggle=True, icon='MOD_MIRROR')
 
         layout.label(text="Shape:")
         row = layout.row(align=True)
@@ -2432,6 +3026,7 @@ class VIEW3D_PT_draw_with_vertex(_VertexToolsPanel, bpy.types.Panel):
         row.prop(s, "use_grid_snap", text="", icon='SNAP_GRID')
         row.prop(s, "use_vertex_snap", text="", icon='SNAP_VERTEX')
         row.prop(s, "use_edge_snap", text="", icon='SNAP_EDGE')
+        row.prop(s, "use_align_snap", text="", icon='SNAP_PERPENDICULAR')
         row.prop(s, "use_merge", text="", icon='AUTOMERGE_ON' if s.use_merge else 'AUTOMERGE_OFF')
         row.separator()
         row.prop(s, "show_fill", text="", icon='SHADING_SOLID')
@@ -2446,6 +3041,46 @@ class VIEW3D_PT_draw_with_vertex(_VertexToolsPanel, bpy.types.Panel):
         col.prop(s, "angle_step")
 
         layout.label(text="Plane passes through the 3D cursor", icon='INFO')
+
+
+class VIEW3D_PT_bool_cutters(_VertexToolsPanel, bpy.types.Panel):
+    bl_label = "Bool Cutters"
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return (context.mode in {'OBJECT', 'EDIT_MESH'} and ob is not None
+                and (_is_cutter(ob) or bool(_part_cutters(ob))))
+
+    def draw(self, context):
+        layout = self.layout
+        ob = context.active_object
+        if _is_cutter(ob):
+            part, mod = _cutter_modifier(ob)
+            if mod is None:
+                layout.label(text="Not used by a Boolean", icon='ERROR')
+            else:
+                layout.label(text=f"{ob.name} on {part.name}", icon='MOD_BOOLEAN')
+                row = layout.row(align=True)
+                row.prop(mod, "operation", expand=True)
+                layout.prop(mod, "solver", text="Solver")
+            if ob.mode != 'EDIT':
+                layout.operator(OBJECT_OT_vertex_tools_edit_cutter.bl_idname, icon='EDITMODE_HLT')
+            row = layout.row(align=True)
+            row.scale_y = 1.3
+            row.operator(OBJECT_OT_vertex_tools_back_to_mesh.bl_idname, icon='LOOP_BACK')
+            row.operator(OBJECT_OT_vertex_tools_apply_bool.bl_idname, icon='CHECKMARK')
+        else:
+            col = layout.column(align=True)
+            for m in _part_cutters(ob):
+                row = col.row(align=True)
+                row.label(text=m.object.name, icon='SELECT_DIFFERENCE' if m.operation == 'DIFFERENCE'
+                          else 'SELECT_EXTEND' if m.operation == 'UNION' else 'SELECT_INTERSECT')
+                _op(row, OBJECT_OT_vertex_tools_edit_cutter.bl_idname, "", 'EDITMODE_HLT', name=m.object.name)
+                row.prop(m, "show_viewport", text="")
+            row = layout.row()
+            row.scale_y = 1.3
+            row.operator(OBJECT_OT_vertex_tools_apply_bool.bl_idname, text="Apply All Bools", icon='CHECKMARK')
 
 
 class VIEW3D_PT_face_projection(_VertexToolsPanel, bpy.types.Panel):
@@ -2510,6 +3145,10 @@ class VIEW3D_MT_vertex_tools(bpy.types.Menu):
         _op(col, draw_id, "Draw Edges Only (Path)", shape='POINTS', result='EDGES')
         _op(col, draw_id, "Draw on Surface", plane='SURFACE')
         col.operator(MESH_OT_draw_on_face.bl_idname, text="Draw on Face")
+        bool_id = MESH_OT_draw_for_bool.bl_idname
+        _op(col, bool_id, "Draw for Bool (Auto)", bool_mode='AUTO')
+        _op(col, bool_id, "Draw for Bool (Cut)", bool_mode='CUT')
+        _op(col, bool_id, "Draw for Bool (Extrude)", bool_mode='EXTRUDE')
 
         col = row.column()
         col.label(text="Face Projection", icon='VIEW_ORTHO')
@@ -2549,12 +3188,17 @@ classes = (
     MESH_OT_draw_face_by_points,
     DrawOnFacePoint,
     MESH_OT_draw_on_face,
+    MESH_OT_draw_for_bool,
+    OBJECT_OT_vertex_tools_edit_cutter,
+    OBJECT_OT_vertex_tools_back_to_mesh,
+    OBJECT_OT_vertex_tools_apply_bool,
     VIEW3D_OT_align_view_to_selection,
     VIEW3D_OT_vertex_tools_view_back,
     VIEW3D_OT_align_and_draw,
     VIEW3D_PT_average_vertex,
     VIEW3D_PT_average_vertex_preview,
     VIEW3D_PT_draw_with_vertex,
+    VIEW3D_PT_bool_cutters,
     VIEW3D_PT_face_projection,
     VIEW3D_MT_vertex_tools,
 )
