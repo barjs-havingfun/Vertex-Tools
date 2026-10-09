@@ -113,7 +113,7 @@ and 32 headless checks passed in Blender 5.2.
 pull it in or out by hand, and get a live, editable Boolean cutter or
 adder object. Then added a symmetric (both directions) pull, a
 bottom-left options panel and CAD-style **Align Snap**.
-Version **3.4.0**. *(Not committed yet.)*
+Version **3.4.0**. Commit: `72fb811`.
 
 ### 1. Review and design of Draw for Bool (~4:30 PM)
 - Reviewed yesterday's session and `vertex_tools.py` to plan the new mode.
@@ -183,7 +183,17 @@ Version **3.4.0**. *(Not committed yet.)*
 - Headless tests passed: highlight on and off the mesh, keys blocked
   while picking, face pick, Space, and empty-space click.
 
+### 7. Commit and push (~5:45 PM)
+- Committed today's work: `72fb811 Draw for Bool, Align Snap and dev log`.
+- **Push rejected** ("fetch first"): GitHub had two README edits made on
+  the website (`abc75f2`, `344c0fa`: the *To Install* section and a
+  shorter Shift+Q note) that weren't on this computer.
+- **Fixed** with `git pull --rebase`, which put today's commit on top of
+  the website edits (no conflicts, different lines), then `git push`.
+- **Lesson:** run `git pull` before working after editing on GitHub. If a
+  push is rejected, run `git pull --rebase` then `git push`. Never use
+  `--force`.
+
 ### Open items
 - Try the new features in the Blender UI: dragging, guide lines, and the
   bottom-left panel with redo after the mode switches.
-- Commit today's work.
