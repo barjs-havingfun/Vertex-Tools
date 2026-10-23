@@ -237,6 +237,17 @@ Read through the whole add-on and listed 10 usability improvements. All
   status lines, and the panel and menu drawing code.
 - README updated for all of it.
 
+### 4. User Guide
+- Wrote **USERGUIDE.md**, a step-by-step guide to every tool:
+  - getting started
+  - each Average Vertex button, with examples
+  - Draw, typed sizes, planes and snapping
+  - Draw on Face and Draw for Bool
+  - Bool Cutters, Face Projection and the Shift+Q menu
+  - recipes
+  - troubleshooting for every error message
+- Linked it from the README.
+
 ### Open items
 - Try in the Blender UI: typing while drawing, the status bar text, the
   new Average Vertex panel, and the Shift+Q Bool Cutters column.

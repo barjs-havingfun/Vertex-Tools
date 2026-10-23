@@ -24,6 +24,9 @@ not using:
   select (3 vertices, 2 edges or a face), flatten a selection onto its
   plane, and draw on it.
 
+New here? The **[User Guide](USERGUIDE.md)** walks through every tool
+step by step, with examples, recipes and troubleshooting.
+
 ---
 
 ## Shift+Q menu
