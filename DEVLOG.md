@@ -173,3 +173,70 @@ Version **3.4.0**.
 ### Open items
 - Try the new features in the Blender UI: dragging, guide lines, and the
   bottom-left panel with redo after the mode switches.
+
+---
+
+## 2026-10-23 (Friday)
+
+**Summary:** Fix Whole Chain and Extrude no longer need the vertices
+clicked one by one. Then a code review for usability, and all 10
+suggestions built: typed exact sizes, a shorter Average Vertex panel with
+a live selection status, key help in the status bar, and tidier Bool
+cutters. Version **3.5.0**.
+
+### 1. Chain order without clicking one by one
+- **Closed loops:** `Alt+click` a ring (or `A` on a circle) and Fix Whole
+  Chain spaces it evenly around the full circle. Before, rings failed
+  because the code looked for two open ends. Line and Curve refuse a loop
+  with a clear message.
+- **Loose vertices** (box select, no edges between them) are ordered by
+  their shape: along the line, around the circle (starting after the
+  biggest gap), or nearest neighbor for a curve.
+- **Extrude** works on any selected path. The active vertex
+  (`Shift+click`) picks the end to grow from. If there's no active end, it
+  asks for one.
+- Click order still wins when every vertex was clicked. Fix Last keeps
+  using click order, because the last click is the target.
+- The report says how the order was found (click order, edge path, edge
+  loop or shape).
+- Headless tests in Blender 5.2 passed: rings, edge paths, loose lines,
+  arcs and U-shapes, extruding from the active end, and the error cases.
+
+### 2. Usability review
+Read through the whole add-on and listed 10 usability improvements. All
+10 were built.
+
+### 3. Usability round
+- **Typed exact sizes:** after the first point, type a number for the
+  length (Points), width / `Tab` / height (Rectangle) or radius (Circle),
+  in the mouse's direction. While pulling a bool, type the exact depth
+  (`-` flips it). Numbers use the scene's units.
+- **Shorter Average Vertex panel:** one Line / Curve / Circle switch and
+  a Keep Distance toggle drive the buttons: Fix Last Vertex, Fix Whole
+  Chain (Fix Chain / Full Circle for circles), Extrude New Vertex and
+  Move Last to Average. That's 6 buttons instead of 14.
+- **Live selection status** in that panel: vertex count, how the order
+  was found, and what's missing before you press anything.
+- **Header and status bar:** the header now only shows what's going on.
+  The key list moved to the status bar, so it no longer gets cut off.
+- **Draw on Face** highlights the face under the mouse before the first
+  click, like Draw for Bool's pick step.
+- **Plane note** in the Draw panel only shows when it's true, and is more
+  accurate.
+- **Error messages** in Draw on Face point to Draw for Bool for shapes
+  that go past the face's edge.
+- **Shift+Q:** a Bool Cutters column (Edit Cutter, Back to Mesh, Apply
+  Bool, Delete Cutter) shows up when there are cutters.
+- **Delete Cutter:** throw a cutter away without applying it, from the
+  panel (✕ per cutter) or Shift+Q.
+- **Tidy cutters:** named Cut / Add / Intersect after what they do, and
+  kept in a **VT Cutters** collection that's removed with the last
+  cutter.
+- Headless tests in Blender 5.2 passed: typed values for every shape and
+  for the depth, mm scenes, naming, the collection, Delete Cutter, the
+  status lines, and the panel and menu drawing code.
+- README updated for all of it.
+
+### Open items
+- Try in the Blender UI: typing while drawing, the status bar text, the
+  new Average Vertex panel, and the Shift+Q Bool Cutters column.

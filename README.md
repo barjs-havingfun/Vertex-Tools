@@ -30,8 +30,10 @@ not using:
 
 In Edit Mode, press **`Shift+Q`** to open the Vertex Tools menu with all
 actions in three columns (Average Vertex, Draw With Vertex, Face
-Projection). To change it: `Edit > Preferences > Keymap`, search for
-`VIEW3D_MT_vertex_tools` (under 3D View > Mesh).
+Projection). When the mesh has Draw for Bool cutters, or you're editing
+one, a fourth **Bool Cutters** column appears (Edit Cutter, Back to Mesh,
+Apply Bool, Delete Cutter). To change the key: `Edit > Preferences >
+Keymap`, search for `VIEW3D_MT_vertex_tools` (under 3D View > Mesh).
 
 The menu is also in `Vertex` menu > `Vertex Tools`.
 
@@ -56,49 +58,80 @@ points, then place the vertices relative to that fit.
 | Curve | Free-form bends: a polynomial (arc / S-curve, adjustable degree) |
 | Circle | Round things: arcs, bolt circles, rims. A true circle, so the radius stays constant |
 
-### Fix Selected Vertex
+### The panel
+
+```
+Fit:  [ Line | Curve | Circle ]
+      [ Keep Distance ]          off = even spacing
+      ✓ 12 verts, edge path      what your selection is
+      [ Fix Last Vertex    ]
+      [ Fix Whole Chain    ]     Circle: [ Fix Chain | Full Circle ]
+      [ Extrude New Vertex ]
+      [ Move Last to Average ]
+```
+
+Pick the **Fit** once and every button uses it. The line under it tells
+you what the selection is before you press anything: how many vertices,
+how their order was found (click order, edge path, edge loop or shape),
+and what's missing, e.g. *Closed loop: use Circle* or *Extrude: Shift+click
+an end*. Every button's options can still be changed afterwards in the
+bottom-left redo panel. The `Shift+Q` menu has every variant as its own
+entry.
+
+### Fix Last Vertex
 
 Select your reference vertices one by one (click, not box-select — the
 order matters), then click one more vertex last: that's the one that gets
 moved.
 
-- **Smart / Curve / Circle: Average Distance** — fits a line, curve or
+- **Fix Last Vertex** (Keep Distance off) — fits a line, curve or
   circle through the reference points. If the target sits beyond either
   end of the chain, it is placed one average spacing (or, for circles,
   one average angle step) further out. If it sits between two neighbors,
   it is placed exactly halfway between them.
-- **Smart / Curve / Circle: Keep Distance** — same fit, but the target's
+- **Fix Last Vertex** (Keep Distance on) — same fit, but the target's
   position *along* it is left untouched; it is only snapped onto the
   line, curve or circle. Use this when a point is roughly the right
   distance along but has drifted sideways.
-- **Move to Average** — places the target at the centroid of all
+- **Move Last to Average** — places the target at the centroid of all
   reference points.
 
 ### Fix Whole Chain
 
-Straighten or smooth a whole chain in one click. Select the chain either
-by clicking the vertices in order, or by selecting one connected path of
-edges (box select works for that).
+Straighten or smooth a whole chain in one click. You don't have to click
+the vertices one by one. The chain's order comes from the first of these
+that works:
 
-- **Chain: Even Along Line** — one straight line, points evenly spaced
-  from the first to the last.
-- **Chain: Even Along Curve** — a curve, points at equal distances along
-  it.
-- **Chain: Even Along Arc** — a circle, points at equal angles from the
-  first to the last.
-- **Chain: Full Circle** — a circle, points evenly spaced around the
+1. **Click order**, if you clicked every vertex one by one.
+2. **Along the selected edges**: one open path, or one **closed loop**
+   (`Alt+click` an edge loop, or `A` on a circle).
+3. **By the shape**, for loose vertices with no edges between them (box
+   select works): along the line, around the circle, or point to nearest
+   point for a curve.
+
+A closed loop always goes around the full circle with Fit = Circle. A
+closed loop can't go on a line or a curve, so you get an error for those.
+
+- **Line** — one straight line, points evenly spaced from the first to
+  the last.
+- **Curve** — a curve, points at equal distances along it.
+- **Circle: Fix Chain** — a circle, points at equal angles from the first
+  to the last.
+- **Circle: Full Circle** — a circle, points evenly spaced around the
   *whole* circle (e.g. 6 points → 60° apart).
 
-In the redo panel (bottom left), set **Placement** to `Keep Distance` to
-only snap each point onto the fit without changing the spacing.
+Turn on **Keep Distance** to only snap each point onto the fit without
+changing the spacing.
 
 ### Extrude New Vertex
 
-Select the chain (in order) and new vertices are created past the last
-selected point, connected by edges, with the spacing / curvature taken
-from the chain.
+Select the chain and new vertices are created past its end point,
+connected by edges, with the spacing / curvature taken from the chain.
+Select it either by clicking the vertices in order (the last click is the
+end), or select the path any way you like (`Alt+click`, box select) and
+`Shift+click` the end vertex to grow from, so that it's the active one.
 
-- **Extrude Along Line / Curve / Circle**.
+- Follows the panel's **Fit** (line, curve or circle).
 - **Count** (redo panel) — add several points in one go.
 
 The new vertices are selected and added to the selection history, so
@@ -127,7 +160,7 @@ buttons.
 |---|---|---|
 | Placement | Fix / Whole Chain | `Average / Even Spacing`, `Keep Distance`, or `Full Circle` (whole chain + circle only) |
 | Curve Degree | Curve fits | 1 = line, 2 = arc, 3 = S-curve (capped at points − 1) |
-| Spacing Scale | Average Distance / Extrude | Multiplier on the computed spacing |
+| Spacing Scale | Fix Last (even spacing) / Extrude | Multiplier on the computed spacing |
 | Window | Fix / Extrude | Use only the last *N* selected points as reference (0 = use all). Useful for long or curved chains where only the local neighborhood should matter |
 | Count | Extrude | How many new points to add |
 
@@ -156,6 +189,25 @@ optionally, a filled face.
 
 Rectangles and circles finish by themselves on the second click.
 
+### Typing exact sizes
+
+After the first point, just **type a number** instead of clicking (like
+in a CAD program). The header shows what you type:
+
+| Shape | What the number sets |
+|---|---|
+| Points | The **length** to the next point, in the direction of the mouse |
+| Rectangle | **Width**, then `Tab`, **Height** (each in the direction of the mouse; leave one empty to keep the mouse's value) |
+| Circle | The **radius** |
+
+`Enter` places the point, `Backspace` deletes a digit, and `Esc` stops
+typing without cancelling the drawing. Numbers are in the scene's units:
+in a scene set to millimeters, `5` means 5 mm.
+
+The **header** at the top shows what's going on (shape, plane, point
+count, active snaps, typed values). The **status bar** at the bottom of
+the window lists the keys.
+
 ### Result
 
 - **Face** — creates a face.
@@ -171,9 +223,10 @@ flat on its plane. Handy together with Face Projection: align the view to
 a face, then draw on it.
 
 1. Press **Draw on Face** and click on a face of the mesh you're editing.
-   That face is outlined in blue and everything you draw stays flat on
-   its plane. Clicking on empty space gives an error: use **Draw** for
-   that.
+   The face under the mouse is highlighted before you click, so you can
+   see which one you'll get. After the click it's outlined in blue, and
+   everything you draw stays flat on its plane. Clicking on empty space
+   gives an error: use **Draw** (or **Draw for Bool**) for that.
 2. Draw as usual: Points, Rectangle or Circle, with all the snapping. With
    **Merge** on, points snapped to the face's corners or edges are shared
    with it, so e.g. a square in the corner of the face shares its edges
@@ -201,7 +254,8 @@ faces, it falls back to Twist 0 (then the other modes) and the message
 at the bottom tells you what was used.
 
 The shape has to stay inside the face; if it goes outside, nothing is
-changed and you get a message. New faces keep the old face's direction.
+changed and you get a message (Draw for Bool can go past the edge). New
+faces keep the old face's direction.
 
 #### Draw on Face vs. Blender's Knife tool (`K`)
 
@@ -270,6 +324,7 @@ make it permanent.
 
 | Key | Action |
 |---|---|
+| Type a number | Exact depth, in the direction you're pulling. `-` flips it, `Backspace` / `Esc` stop typing |
 | `Tab` | Switch Auto / Cut / Extrude |
 | `B` | **Both Directions**: pull the same distance to both sides of the plane (like a CAD *symmetric* extrude), e.g. a slot cut through a wall from its middle |
 | `A` | Align Snap: hover any vertex of the mesh to pull to exactly its height (green dot + guide line) |
@@ -298,11 +353,18 @@ has:
 | **Edit Cutter** | Edit a cutter again (on the mesh: one ✎ button per cutter, plus an eye to hide its effect) |
 | **Back to Mesh** | Leave the cutter and edit your mesh again |
 | **Apply Bool** | Make it permanent and delete the cutter. On a cutter: just that one. On the mesh: **Apply All Bools** |
+| **Delete Cutter** | Throw the cutter away *without* applying it, the mesh goes back to how it was (on the mesh: one ✕ button per cutter) |
 
-The cutter is parented to your mesh (it moves with it), shows as a
-wireframe and is hidden in renders. Each Draw for Bool adds a new cutter,
-so you can stack several before applying. The cuts stay visible while
-you're back in Edit Mode on your mesh.
+The same actions are in the `Shift+Q` menu.
+
+Cutters are named after what they do, **Cut**, **Add** or **Intersect**
+(`Cut.001`, ...), and live in their own **VT Cutters** collection inside
+your mesh's collection, so the Outliner stays tidy. The collection is
+removed again when its last cutter is applied or deleted. The cutter is
+parented to your mesh (it moves with it), shows as a wireframe and is
+hidden in renders. Each Draw for Bool adds a new cutter, so you can stack
+several before applying. The cuts stay visible while you're back in Edit
+Mode on your mesh.
 
 ### Drawing plane
 
@@ -314,7 +376,10 @@ you're back in Edit Mode on your mesh.
 | X / Y / Z | Locked to the plane perpendicular to that axis (side / front / top) |
 
 The snap options are one row of icon toggles next to **Snap** (grid, vertex, edge,
-merge, and fill preview). Hover an icon to see its name.
+align, merge, and fill preview). Hover an icon to see its name.
+
+For every plane except Surface, the plane goes through the 3D cursor, or
+through your first point if that point snapped onto a vertex.
 
 ### Snapping
 
@@ -354,6 +419,7 @@ New faces are oriented so their normal points toward the viewer.
 | Key | Action |
 |---|---|
 | `LMB` | Add a point (click the first point to close) |
+| `0`–`9`, `.` | Type an exact length / width / height / radius (`Tab` next field, `Enter` place, `Esc` stop typing) |
 | `Ctrl` (hold) | Angle snap |
 | `R` / `C` | Rectangle / Circle shape (press again for Points) |
 | `+` / `-` | More / fewer circle sides |

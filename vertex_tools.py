@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Vertex Tools",
     "author": "Baris",
-    "version": (3, 4, 0),
+    "version": (3, 5, 0),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Edit Mode > N Panel > Vertex Tools tab, Shift+Q menu, and Vertex / Mesh menus",
     "description": "Average Vertex: fix or extend a chain of vertices (line, curve, circle or average). "
@@ -251,7 +251,7 @@ def extrude_calc(pts_chrono, fit, degree, scale):
     return anchor + d * spacing * scale
 
 
-def chain_fix(pts, fit, degree, placement):
+def chain_fix(pts, fit, degree, placement, closed=False):
     """
     New positions for a whole chain of points, fitted to one line, curve or circle.
 
@@ -261,19 +261,23 @@ def chain_fix(pts, fit, degree, placement):
     placement : 'AVERAGE' -> evenly spaced from the first to the last point
                 'KEEP'    -> every point keeps its place along the fit, only snapped onto it
                 'FULL'    -> circle only: evenly spaced around the whole circle
+    closed    : the chain is a closed loop (circle only; always spaced around the full circle
+                unless KEEP)
 
     Returns list of Vector (same order). Raises ValueError for unusable input.
     """
     n = len(pts)
     if n < 3:
         raise ValueError("Select at least 3 vertices for a chain.")
+    if closed and fit != 'CIRCLE':
+        raise ValueError("This is a closed loop, use the circle (a line or curve needs an open path).")
 
     if fit == 'CIRCLE':
         circ = fit_circle(pts)
         th = np.unwrap([circ.angle(p) for p in pts])
         if placement == 'KEEP':
             return [circ.at(t) for t in th]
-        if placement == 'FULL':
+        if placement == 'FULL' or closed:
             step = 2.0 * math.pi / n * (1.0 if th[-1] >= th[0] else -1.0)
             return [circ.at(th[0] + k * step) for k in range(n)]
         return [circ.at(t) for t in np.linspace(th[0], th[-1], n)]
@@ -302,11 +306,57 @@ def chain_fix(pts, fit, degree, placement):
     return [_eval_curve(coefs, ui) for ui in u_new]
 
 
-def selected_chain(bm):
+def _walk_edges(selected, links, start):
+    """Follow the selected edges from `start`. Returns the visited vertices in order."""
+    chain, prev = [start], None
+    while len(chain) < len(selected):
+        nxt = [v for v in links[chain[-1]] if v is not prev]
+        if not nxt or nxt[0] is start:
+            break
+        prev = chain[-1]
+        chain.append(nxt[0])
+    return chain
+
+
+def _order_by_shape(verts, mw, fit):
+    """Order loose vertices (no edges between them) by the shape they lie on."""
+    pts = [mw @ v.co for v in verts]
+    n = len(pts)
+    if fit == 'CIRCLE' and n >= 3:
+        circ = fit_circle(pts)
+        two_pi = 2.0 * math.pi
+        th = [circ.angle(p) % two_pi for p in pts]
+        idx = sorted(range(n), key=lambda i: th[i])
+        # Start right after the biggest gap, so an arc runs from one end to the other
+        g = max(range(n), key=lambda k: (th[idx[(k + 1) % n]] - th[idx[k]]) % two_pi)
+        idx = idx[g + 1:] + idx[:g + 1]
+    else:
+        line = fit_line(pts)
+        if line is None:
+            raise ValueError("The selected points are at the same location, no direction to follow.")
+        c, d = line
+        idx = sorted(range(n), key=lambda i: (pts[i] - c).dot(d))
+        if fit == 'CURVE':
+            # Nearest-neighbor walk from one end, so U-shapes come out in the right order
+            order, left = [idx[0]], set(idx[1:])
+            while left:
+                last = pts[order[-1]]
+                nxt = min(left, key=lambda i: (pts[i] - last).length)
+                order.append(nxt)
+                left.remove(nxt)
+            idx = order
+    return [verts[i] for i in idx]
+
+
+def selected_chain(bm, mw=None, fit=None):
     """
-    The selected vertices as an ordered chain: selection order when every vertex has one,
-    otherwise followed along the selected edges (must be one open path).
-    Returns list of BMVert, or None.
+    The selected vertices as an ordered chain. Tried in this order:
+      1. click order, when every selected vertex was clicked one by one
+      2. along the selected edges: one open path, or one closed loop
+      3. (when `fit` is given) by the shape of loose points: along the line,
+         around the circle, or nearest neighbor for a curve
+    The active (last clicked) vertex ends up last on an open chain, first on a loop.
+    Returns (list of BMVert, closed, how) or None.
     """
     selected = [v for v in bm.verts if v.select]
     ordered = [
@@ -314,22 +364,33 @@ def selected_chain(bm):
         if isinstance(e, bmesh.types.BMVert) and e.select
     ]
     if len(ordered) == len(selected):
-        return ordered
+        return ordered, False, "click order"
 
+    active = bm.select_history.active
     sel = set(selected)
     links = {v: [e.other_vert(v) for e in v.link_edges if e.other_vert(v) in sel] for v in selected}
-    ends = [v for v in selected if len(links[v]) == 1]
-    if len(ends) != 2 or any(len(nb) > 2 for nb in links.values()):
-        return None
+    degrees = [len(nb) for nb in links.values()]
 
-    chain, prev = [ends[0]], None
-    while len(chain) < len(selected):
-        nxt = [v for v in links[chain[-1]] if v is not prev]
-        if not nxt:
-            return None
-        prev = chain[-1]
-        chain.append(nxt[0])
-    return chain
+    if len(selected) >= 3 and all(d == 2 for d in degrees):
+        start = active if active in sel else selected[0]
+        chain = _walk_edges(selected, links, start)
+        if len(chain) == len(selected):
+            return chain, True, "edge loop"
+
+    ends = [v for v in selected if len(links[v]) == 1]
+    if len(ends) == 2 and max(degrees) <= 2:
+        chain = _walk_edges(selected, links, ends[0])
+        if len(chain) == len(selected):
+            if chain[0] is active:
+                chain.reverse()
+            return chain, False, "edge path"
+
+    if fit is None or mw is None or len(selected) < 2:
+        return None
+    chain = _order_by_shape(selected, mw, fit)
+    if chain[0] is active:
+        chain.reverse()
+    return chain, False, "shape"
 
 
 # ----------------------------------------------------------------------------
@@ -437,26 +498,34 @@ def plan_fix_last(bm, mw, mode, placement, degree, scale, window):
 
 def plan_chain(bm, mw, fit, degree, placement):
     """Move every vertex of the selected chain onto one line / curve / circle."""
-    chain = selected_chain(bm)
-    if chain is None:
-        raise ValueError("Can't find the chain order. Click the vertices one by one, "
-                         "or select one connected path of edges.")
-    new = chain_fix([mw @ v.co for v in chain], fit, degree, placement)
-    how = {'KEEP': "snapped", 'FULL': "spaced around the full circle"}.get(placement, "evenly spaced")
-    return Plan(moves=zip(chain, new), msg=f"Fixed {len(chain)} vertices onto the {fit.lower()}, {how}")
+    found = selected_chain(bm, mw, fit)
+    if found is None:
+        raise ValueError("Can't find the chain order. Select one path or loop of edges (Alt+click), "
+                         "or click the vertices one by one.")
+    chain, closed, order = found
+    new = chain_fix([mw @ v.co for v in chain], fit, degree, placement, closed)
+    if closed and placement != 'KEEP':
+        how = "spaced around the full circle"
+    else:
+        how = {'KEEP': "snapped", 'FULL': "spaced around the full circle"}.get(placement, "evenly spaced")
+    return Plan(moves=zip(chain, new),
+                msg=f"Fixed {len(chain)} vertices onto the {fit.lower()}, {how} (order: {order})")
 
 
 def plan_extrude(bm, mw, fit, degree, scale, window, count):
-    """New points continuing the chain past the last selected vertex."""
+    """New points continuing the chain past its end vertex."""
     selected = [v for v in bm.verts if v.select]
     if len(selected) < 2:
-        raise ValueError("Select at least 2 vertices (3 for curve / circle), one by one (click), in order.")
-    ordered = [
-        e for e in bm.select_history
-        if isinstance(e, bmesh.types.BMVert) and e.select
-    ]
-    if len(ordered) != len(selected):
-        raise ValueError("Some selected vertices have no selection order. Select them one by one (click).")
+        raise ValueError("Select at least 2 vertices (3 for curve / circle).")
+    found = selected_chain(bm, mw, fit)
+    if found is None:
+        raise ValueError("Can't find the chain order. Select one path of edges (Alt+click), "
+                         "or click the vertices one by one.")
+    ordered, closed, order = found
+    if closed:
+        raise ValueError("This is a closed loop, there is no end to extend. Select an open path.")
+    if order != "click order" and bm.select_history.active is not ordered[-1]:
+        raise ValueError("Which end? Shift+click the end vertex to extend from (make it active).")
 
     chain = [mw @ v.co for v in ordered]
     new = []
@@ -466,6 +535,34 @@ def plan_extrude(bm, mw, fit, degree, scale, window, count):
     word = "point" if len(new) == 1 else "points"
     return Plan(extrude_from=ordered[-1], extrude_pts=new,
                 msg=f"Extruded {len(new)} new {word} continuing the {fit.lower()}")
+
+
+def selection_status(context, fit):
+    """Short lines for the panel: what the selection is and what's missing. [(text, icon)]"""
+    obj = context.edit_object
+    if obj is None:
+        return []
+    n = obj.data.total_vert_sel
+    if n == 0:
+        return [("Select vertices", 'INFO')]
+    bm = bmesh.from_edit_mesh(obj.data)
+    if len(bm.verts) > 200000:  # keep the panel fast on huge meshes
+        return [(f"{n} selected", 'INFO')]
+    try:
+        found = selected_chain(bm, obj.matrix_world, fit)
+    except ValueError as e:
+        return [(str(e), 'ERROR')]
+    if found is None:
+        return [(f"{n} selected, no chain order", 'ERROR')]
+    chain, closed, how = found
+    lines = [(f"{n} verts, {'closed loop' if closed else how}", 'CHECKMARK')]
+    if closed and fit != 'CIRCLE':
+        lines.append(("Closed loop: use Circle", 'ERROR'))
+    elif closed:
+        lines.append(("Extrude needs an open path", 'INFO'))
+    elif how != "click order" and bm.select_history.active is not chain[-1]:
+        lines.append(("Extrude: Shift+click an end", 'INFO'))
+    return lines
 
 
 def plan_flatten(bm, mw):
@@ -697,6 +794,14 @@ ACTION_ITEMS = [
 
 
 class AverageVertexSettings(bpy.types.PropertyGroup):
+    # The main panel: one Fit switch for all buttons
+    fit: bpy.props.EnumProperty(name="Fit", items=FIT_ITEMS, default='LINE')
+    keep: bpy.props.BoolProperty(
+        name="Keep Distance",
+        description="Fix Last / Fix Chain: only snap the points onto the line, curve or circle, "
+                    "keep their spacing. Off = even spacing",
+        default=False,
+    )
     action: bpy.props.EnumProperty(name="Action", items=ACTION_ITEMS, default='CHAIN_LINE',
                                    update=_tag_redraw_views)
     placement: bpy.props.EnumProperty(name="Placement", items=PLACEMENT_ITEMS, default='AVERAGE',
@@ -1050,9 +1155,9 @@ def _draw_pick_hover(face):
 
 
 def _draw_callback(op, context):
+    if getattr(op, "pick_hover", None):
+        _draw_pick_hover(op.pick_hover)
     if getattr(op, "pick_phase", False):
-        if op.pick_hover:
-            _draw_pick_hover(op.pick_hover)
         return
     s = _settings(context)
     outline, closing = op.preview_outline(s)
@@ -1125,6 +1230,37 @@ def _draw_callback(op, context):
 
 def _keep_items(items):
     return (('KEEP', "Current", "Use the current setting"),) + tuple(items)
+
+
+# Typing exact values while drawing / pulling
+NUM_KEYS = {
+    **{name: str(i) for i, name in enumerate(
+        ('ZERO', 'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN', 'EIGHT', 'NINE'))},
+    **{f'NUMPAD_{i}': str(i) for i in range(10)},
+    'PERIOD': ".", 'NUMPAD_PERIOD': ".",
+}
+
+
+def _parse_length(context, text):
+    """A typed length in scene units (5 = 5 mm when the scene shows mm), as Blender units. None if empty."""
+    if not text or text == ".":
+        return None
+    unit = context.scene.unit_settings
+    if unit.system == 'NONE':
+        return float(text)
+    try:
+        ref = bpy.utils.units.to_string(unit.system, 'LENGTH', unit.scale_length)  # what 1 unit shows as
+        return bpy.utils.units.to_value(unit.system, 'LENGTH', text, str_ref_unit=ref) / unit.scale_length
+    except (ValueError, TypeError):
+        return float(text)
+
+
+def _status_set(context, text):
+    """Key help in the status bar at the bottom (None clears it)."""
+    try:
+        context.workspace.status_text_set(text)
+    except (AttributeError, TypeError):
+        pass
 
 
 class _DrawBase:
@@ -1408,7 +1544,84 @@ class _DrawBase:
     def _title(self):
         return "Draw"
 
+    # --- typed values -----------------------------------------------------------
+
+    @staticmethod
+    def _typed_fields(s):
+        return {'POINTS': ["Length"], 'RECT': ["Width", "Height"], 'CIRCLE': ["Radius"]}[s.shape]
+
+    def _can_type(self, s):
+        """A number can be typed once there's a point to measure from."""
+        return bool(self.points) and (s.shape == 'POINTS' or len(self.points) == 1)
+
+    def _apply_typed(self, context):
+        """Move the hover point to the typed length / width / height / radius, in the mouse's direction."""
+        s = _settings(context)
+        vals = [_parse_length(context, t) for t in self.typed]
+        if all(v is None for v in vals):
+            return
+        a = self._project(self.points[-1])
+        d = self._project(self.hover) - a
+        if s.shape == 'RECT':
+            du, dv = d.dot(self.plane_u), d.dot(self.plane_v)
+            if vals[0] is not None:
+                du = math.copysign(vals[0], du if abs(du) > 1e-12 else 1.0)
+            if vals[1] is not None:
+                dv = math.copysign(vals[1], dv if abs(dv) > 1e-12 else 1.0)
+            p = a + self.plane_u * du + self.plane_v * dv
+        else:
+            direction = d.normalized() if d.length > 1e-9 else self.plane_u
+            p = a + direction * vals[0]
+        self.hover = p
+        self.hover_vidx = self.hover_edge = self.hover_edge_co = None
+        self.hover_closes = False
+        self.hover_snapped = True
+        self.align_guides = []
+
+    def _typed_text(self, s):
+        if self.typed is None:
+            return " | type a number for an exact size" if self._can_type(s) else ""
+        fields = self._typed_fields(s)
+        parts = [f"[{name}: {text}_]" if i == self.typed_idx else f"{name}: {text or '-'}"
+                 for i, (name, text) in enumerate(zip(fields, self.typed))]
+        return " | " + " ".join(parts) + (" (Tab: next)" if len(fields) > 1 else "")
+
+    def _type_key(self, context, event):
+        """Typing a number: digits, Backspace, Tab, Esc (stop typing), Enter (place the point).
+        Returns the modal result, or None when the key isn't for typing."""
+        s = _settings(context)
+        if event.type in NUM_KEYS and self._can_type(s):
+            if self.typed is None:
+                self.typed = [""] * len(self._typed_fields(s))
+                self.typed_idx = 0
+            self.typed[self.typed_idx] += NUM_KEYS[event.type]
+            return self._refresh(context, event.ctrl)
+        if self.typed is None:
+            return None
+        if event.type == 'BACK_SPACE':
+            self.typed[self.typed_idx] = self.typed[self.typed_idx][:-1]
+            if not any(self.typed):
+                self.typed = None
+            return self._refresh(context, event.ctrl)
+        if event.type == 'TAB':
+            self.typed_idx = (self.typed_idx + 1) % len(self.typed)
+            return self._refresh(context, event.ctrl)
+        if event.type == 'ESC':
+            self.typed = None
+            return self._refresh(context, event.ctrl)
+        if event.type in {'RET', 'NUMPAD_ENTER', 'SPACE'}:
+            self._update_hover(context, event.ctrl)
+            return self._click(context)
+        return None
+
+    # --- hover ---------------------------------------------------------------
+
     def _update_hover(self, context, ctrl):
+        self._snap_hover(context, ctrl)
+        if self.typed is not None and self.hover is not None and self.points:
+            self._apply_typed(context)
+
+    def _snap_hover(self, context, ctrl):
         s = _settings(context)
         self.hover_vidx = None
         self.hover_edge = None
@@ -1489,22 +1702,25 @@ class _DrawBase:
     # --- UI ------------------------------------------------------------------
 
     def _update_header(self, context):
+        """Header: what's going on (short, so it fits). Status bar: the keys."""
         s = _settings(context)
-        on = lambda b: "ON" if b else "off"
-        shape = {'POINTS': "Points", 'RECT': "Rectangle", 'CIRCLE': f"Circle ({s.sides} sides, +/-)"}[s.shape]
+        shape = {'POINTS': "Points", 'RECT': "Rectangle", 'CIRCLE': f"Circle ({s.sides} sides)"}[s.shape]
         result = "Face" if s.result == 'FACE' else "Edges"
+        snaps = [name for on, name in ((s.use_grid_snap, "Grid"), (s.use_vertex_snap, "Vertex"),
+                                       (s.use_edge_snap, "Edge"), (s.use_align_snap, "Align"),
+                                       (s.use_merge, "Merge")) if on]
         context.area.header_text_set(
-            f"{self._title()} {shape} -> {result}: {len(self.points)} pt | Plane: {self.plane_label} "
-            f"[X/Y/Z lock, S surface, again = view] | R rect, C circle | P edges only: "
-            f"{on(s.result == 'EDGES')} | G grid: {on(s.use_grid_snap)} | "
-            f"V vertex: {on(s.use_vertex_snap)} | E edge: {on(s.use_edge_snap)} | "
-            f"A align: {on(s.use_align_snap)} | "
-            f"M merge: {on(s.use_merge)} | F fill: {on(s.show_fill)} | "
-            "Ctrl: angle | LMB add | Backspace undo | Enter/RMB finish | Esc cancel")
+            f"{self._title()} {shape} -> {result}: {len(self.points)} pt | Plane: {self.plane_label} | "
+            f"Snap: {', '.join(snaps) or 'none'}{self._typed_text(s)}")
+        _status_set(context,
+                    "LMB add | Enter/RMB finish | Backspace undo | Esc cancel | type a number: exact size | "
+                    "X/Y/Z lock plane, S surface | R rect, C circle, +/- sides | P edges only | "
+                    "G grid, V vertex, E edge, A align, M merge, F fill | Ctrl angle")
 
     def _finish(self, context):
         bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
         context.area.header_text_set(None)
+        _status_set(context, None)
         context.area.tag_redraw()
 
     # --- modal ---------------------------------------------------------------
@@ -1513,6 +1729,8 @@ class _DrawBase:
         self.points, self.point_vidx, self.point_edge, self.point_fixed = [], [], [], []
         self.first_normal = None
         self.closed = False
+        self.typed = None
+        self.typed_idx = 0
 
     def invoke(self, context, event):
         s = _settings(context)
@@ -1607,32 +1825,14 @@ class _DrawBase:
         if event.value != 'PRESS':
             return {'RUNNING_MODAL'}
 
+        typed = self._type_key(context, event)
+        if typed is not None:
+            return typed
+
         if event.type == 'LEFTMOUSE':
             self._set_mouse(event)
             self._update_hover(context, event.ctrl)
-            if self.hover_closes:
-                self.closed = True
-                return self._complete(context)
-            if self.hover is not None:
-                if (s.use_merge and self.hover_vidx is not None
-                        and self.hover_vidx in self.point_vidx):
-                    self.report({'WARNING'}, "That vertex is already part of this shape")
-                    return {'RUNNING_MODAL'}
-                if not self._accept_point(context):
-                    return {'RUNNING_MODAL'}
-                self.points.append(self.hover.copy())
-                self.point_vidx.append(self.hover_vidx)
-                self.point_edge.append(self.hover_edge)
-                self.point_fixed.append(self.hover_vidx is not None or self.hover_edge is not None
-                                        or self.hover_on_surface)
-                if len(self.points) == 1:
-                    self.first_normal = self.hover_normal
-                    # Re-anchor the plane on the first point
-                    self._setup_plane(context)
-                if s.shape != 'POINTS' and len(self.points) == 2:
-                    return self._complete(context)
-                self._update_header(context)
-            return {'RUNNING_MODAL'}
+            return self._click(context)
 
         if event.type == 'BACK_SPACE' or (event.type == 'Z' and event.ctrl):
             if self.points:
@@ -1675,6 +1875,34 @@ class _DrawBase:
             self._finish(context)
             return {'CANCELLED'}
 
+        return {'RUNNING_MODAL'}
+
+    def _click(self, context):
+        """Add the hover point (clicked, or Enter after typing a number)."""
+        s = _settings(context)
+        if self.hover_closes:
+            self.closed = True
+            return self._complete(context)
+        if self.hover is not None:
+            if (s.use_merge and self.hover_vidx is not None
+                    and self.hover_vidx in self.point_vidx):
+                self.report({'WARNING'}, "That vertex is already part of this shape")
+                return {'RUNNING_MODAL'}
+            if not self._accept_point(context):
+                return {'RUNNING_MODAL'}
+            self.points.append(self.hover.copy())
+            self.point_vidx.append(self.hover_vidx)
+            self.point_edge.append(self.hover_edge)
+            self.point_fixed.append(self.hover_vidx is not None or self.hover_edge is not None
+                                    or self.hover_on_surface)
+            self.typed = None
+            if len(self.points) == 1:
+                self.first_normal = self.hover_normal
+                # Re-anchor the plane on the first point
+                self._setup_plane(context)
+            if s.shape != 'POINTS' and len(self.points) == 2:
+                return self._complete(context)
+            self._update_header(context)
         return {'RUNNING_MODAL'}
 
     def _complete(self, context):
@@ -1951,7 +2179,8 @@ def cut_shape_into_face(obj, points, point_vidx, point_edge, face_index, method,
     poly = [to2d(fv.co) for fv in face.verts]
     eps = 1e-4 * max((a - b).length for a in poly for b in poly) + 1e-6
     if not all(_point_in_polygon(to2d(p), poly, eps) for p in loc):
-        raise ValueError("the shape goes outside the face. Keep it inside, or use Draw")
+        raise ValueError("the shape goes outside the face. Keep it inside, or use Draw for Bool "
+                         "(it can go past the face's edge)")
 
     verts, edges = _lookup_merged(bm, point_vidx, point_edge, use_merge)
     _make_verts(bm, loc, verts, edges)
@@ -2028,7 +2257,23 @@ class _FaceDrawBase(_DrawBase):
     def invoke(self, context, event):
         self.target_face = None
         self.target_outline = None
+        self.pick_index = None
+        self.pick_hover = None
         return super().invoke(context, event)
+
+    def _update_pick_hover(self, context):
+        """Highlight the face under the mouse (before a face is picked)."""
+        hit = self._face_under_mouse(context) if self.target_face is None else None
+        index = hit[0] if hit else None
+        if index == self.pick_index:
+            return
+        self.pick_index = index
+        self.pick_hover = None
+        if index is not None:
+            obj = context.edit_object
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.faces.ensure_lookup_table()
+            self.pick_hover = [obj.matrix_world @ v.co for v in bm.faces[index].verts]
 
     def _face_under_mouse(self, context):
         """(face index, world hit point, world normal) of the edited mesh's visible face under the mouse."""
@@ -2060,6 +2305,7 @@ class _FaceDrawBase(_DrawBase):
         self.face_no = (mw.inverted_safe().transposed().to_3x3() @ face.normal).normalized()
         self.face_co = mw @ face.calc_center_median()
         self.target_outline = [mw @ fv.co for fv in face.verts]
+        self.pick_index = self.pick_hover = None  # the picked face shows as the outline now
         return True
 
     def _setup_plane(self, context):
@@ -2106,10 +2352,15 @@ class MESH_OT_draw_on_face(_FaceDrawBase, bpy.types.Operator):
     def _title(self):
         return "Draw on Face"
 
+    def _update_hover(self, context, ctrl):
+        super()._update_hover(context, ctrl)
+        self._update_pick_hover(context)  # highlight the face the first click would draw on
+
     def _accept_point(self, context):
         if self.points or self._pick_face(context):
             return True
-        self.report({'ERROR'}, "You are drawing on empty space: click on a face, or use Draw instead")
+        self.report({'ERROR'}, "You are drawing on empty space: click on a face, or use Draw "
+                               "(or Draw for Bool on the view plane)")
         return False
 
     def _complete(self, context):
@@ -2215,11 +2466,39 @@ def _build_prism(me, outline, z0, z1):
     me.update()
 
 
+CUTTER_NAMES = {'DIFFERENCE': "Cut", 'UNION': "Add", 'INTERSECT': "Intersect"}
+
+
+def _cutter_collection(context, part):
+    """The "VT Cutters" collection inside the part's collection (made when needed), kept out of renders."""
+    parent = part.users_collection[0] if part.users_collection else context.scene.collection
+    coll = next((c for c in parent.children if c.get("vt_cutters")), None)
+    if coll is None:
+        coll = bpy.data.collections.new("VT Cutters")
+        coll["vt_cutters"] = True
+        coll.hide_render = True
+        parent.children.link(coll)
+    return coll
+
+
+def _name_cutter(cutter, mod):
+    """Name the cutter and its modifier after what it does: Cut, Add or Intersect (.001, ...)."""
+    base = CUTTER_NAMES.get(mod.operation, "Cutter")
+    if cutter.name.split(".")[0] != base:
+        cutter.name = base
+        cutter.data.name = base
+    mod.name = f"VT {cutter.name}"
+
+
 def _remove_cutter(cutter):
     me = cutter.data
+    colls = [c for c in cutter.users_collection if c.get("vt_cutters")]
     bpy.data.objects.remove(cutter)
     if me is not None and me.users == 0:
         bpy.data.meshes.remove(me)
+    for c in colls:  # the last cutter is gone: remove the empty collection too
+        if not c.objects and not c.children:
+            bpy.data.collections.remove(c)
 
 
 def _edit_only(context, ob):
@@ -2292,20 +2571,6 @@ class MESH_OT_draw_for_bool(_FaceDrawBase, bpy.types.Operator):
 
     # --- pick phase: a face, or the view plane through the 3D cursor ----------
 
-    def _update_pick_hover(self, context):
-        """Highlight the face under the mouse."""
-        hit = self._face_under_mouse(context)
-        index = hit[0] if hit else None
-        if index == self.pick_index:
-            return
-        self.pick_index = index
-        self.pick_hover = None
-        if index is not None:
-            obj = context.edit_object
-            bm = bmesh.from_edit_mesh(obj.data)
-            bm.faces.ensure_lookup_table()
-            self.pick_hover = [obj.matrix_world @ v.co for v in bm.faces[index].verts]
-
     def _start_drawing(self, context):
         self.pick_phase = False
         self.pick_hover = None
@@ -2339,7 +2604,9 @@ class MESH_OT_draw_for_bool(_FaceDrawBase, bpy.types.Operator):
         if getattr(self, "pick_phase", False):
             context.area.header_text_set(
                 f"{self._title()}: click a FACE to cut / add on it, or SPACE (or click empty space) "
-                "for the view plane through the 3D cursor | Esc: cancel")
+                "for the view plane through the 3D cursor")
+            _status_set(context, "LMB on a face: draw on it | Space / LMB on empty space: view plane "
+                                 "through the 3D cursor | Esc / RMB: cancel")
         else:
             super()._update_header(context)
 
@@ -2374,9 +2641,9 @@ class MESH_OT_draw_for_bool(_FaceDrawBase, bpy.types.Operator):
     def _create_cutter(self, context, part, matrix):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
-        me = bpy.data.meshes.new("VT_Cutter")
-        cutter = bpy.data.objects.new("VT_Cutter", me)
-        (part.users_collection[0] if part.users_collection else context.collection).objects.link(cutter)
+        me = bpy.data.meshes.new("Cut")
+        cutter = bpy.data.objects.new("Cut", me)
+        _cutter_collection(context, part).objects.link(cutter)
         cutter["vt_cutter"] = True
         cutter.display_type = 'WIRE'
         cutter.hide_render = True
@@ -2410,6 +2677,8 @@ class MESH_OT_draw_for_bool(_FaceDrawBase, bpy.types.Operator):
             base = -self.overshoot if d > 0.0 else 0.0
         _build_prism(self.cutter.data, self.outline, base, d)
         self.mod.operation = op
+        _name_cutter(self.cutter, self.mod)
+        self.stored_cutter = self.cutter.name
         return op, d
 
     # --- shape done: build the cutter and start pulling ----------------------
@@ -2452,6 +2721,8 @@ class MESH_OT_draw_for_bool(_FaceDrawBase, bpy.types.Operator):
         self.raw_depth = 0.0
         self.last_mouse = None
         self.depth_snap = None
+        self.depth_typed = None
+        self.depth_flip = False
         self._depth_handle = bpy.types.SpaceView3D.draw_handler_add(
             _depth_draw_callback, (self,), 'WINDOW', 'POST_VIEW')
         self._update_cutter()
@@ -2485,9 +2756,17 @@ class MESH_OT_draw_for_bool(_FaceDrawBase, bpy.types.Operator):
         s = _settings(context)
         depth = self.raw_depth
         self.depth_snap = None
+        typed = _parse_length(context, self.depth_typed) if self.depth_typed else None
         # Align Snap: hover a vertex to pull to exactly its height
-        hit = self._nearest_screen_point(context, self.mesh_verts) if s.use_align_snap else None
-        if hit:
+        hit = self._nearest_screen_point(context, self.mesh_verts) if s.use_align_snap and typed is None else None
+        if typed is not None:
+            # Typed distance, in the direction the mouse pulls (- flips it)
+            if abs(depth) > 1e-12:
+                sign = math.copysign(1.0, depth)
+            else:
+                sign = 1.0 if self.bool_mode == 'EXTRUDE' else -1.0
+            depth = -sign * typed if self.depth_flip else sign * typed
+        elif hit:
             self.depth_snap = hit[1]
             depth = (hit[1] - self.depth_c).dot(self.depth_n)
         elif ctrl:
@@ -2502,17 +2781,23 @@ class MESH_OT_draw_for_bool(_FaceDrawBase, bpy.types.Operator):
         dist = bpy.utils.units.to_string(unit.system, 'LENGTH', abs(d) * unit.scale_length, precision=4)
         on = lambda b: "ON" if b else "off"
         where = "both ways" if self.symmetric else ("out" if d > 0.0 else "in")
+        if self.depth_typed:
+            typed = f" | [Depth: {self.depth_typed}_] (- flips, Backspace / Esc: stop typing)"
+        else:
+            typed = " | type a number for an exact depth"
         context.area.header_text_set(
             f"{self._title()}: {'Cut' if op == 'DIFFERENCE' else 'Add'} {dist} {where}"
-            f"{' (snapped to vertex)' if self.depth_snap is not None else ''} | Move the mouse to pull | "
-            f"Tab: Auto / Cut / Extrude | B both directions: {on(self.symmetric)} | "
-            f"A align to vertex: {on(_settings(context).use_align_snap)} | Ctrl: snap to grid size | "
-            "LMB / Enter: done | RMB / Esc: cancel")
+            f"{' (snapped to vertex)' if self.depth_snap is not None else ''} | "
+            f"Both directions: {on(self.symmetric)} | Align: {on(_settings(context).use_align_snap)}{typed}")
+        _status_set(context, "Move the mouse to pull | LMB / Enter: done | RMB / Esc: cancel | "
+                             "type a number: exact depth | Tab: Auto / Cut / Extrude | B both directions | "
+                             "A align to vertex height | Ctrl: snap to grid size")
         context.area.tag_redraw()
 
     def _end_depth(self, context):
         bpy.types.SpaceView3D.draw_handler_remove(self._depth_handle, 'WINDOW')
         context.area.header_text_set(None)
+        _status_set(context, None)
         context.area.tag_redraw()
 
     def _depth_modal(self, context, event):
@@ -2529,6 +2814,20 @@ class MESH_OT_draw_for_bool(_FaceDrawBase, bpy.types.Operator):
             self._set_depth(context, event.value == 'PRESS')
             return {'RUNNING_MODAL'}
         if event.value != 'PRESS':
+            return {'RUNNING_MODAL'}
+        # Typing an exact depth
+        if event.type in NUM_KEYS:
+            self.depth_typed = (self.depth_typed or "") + NUM_KEYS[event.type]
+            self._set_depth(context, event.ctrl)
+            return {'RUNNING_MODAL'}
+        if self.depth_typed is not None and event.type in {'BACK_SPACE', 'MINUS', 'NUMPAD_MINUS', 'ESC'}:
+            if event.type == 'BACK_SPACE':
+                self.depth_typed = self.depth_typed[:-1] or None
+            elif event.type == 'ESC':
+                self.depth_typed = None
+            else:
+                self.depth_flip = not self.depth_flip
+            self._set_depth(context, event.ctrl)
             return {'RUNNING_MODAL'}
         if event.type in {'TAB', 'B', 'A'}:
             if event.type == 'TAB':
@@ -2662,6 +2961,42 @@ class OBJECT_OT_vertex_tools_apply_bool(bpy.types.Operator):
                 _remove_cutter(cutter)
         _edit_only(context, part)
         self.report({'INFO'}, f"Applied {len(mods)} Boolean{'s' if len(mods) != 1 else ''}")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_vertex_tools_delete_cutter(bpy.types.Operator):
+    """Delete a cutter and its Boolean without applying it (the mesh goes back to how it was)"""
+    bl_idname = "object.vertex_tools_delete_cutter"
+    bl_label = "Delete Cutter"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    name: bpy.props.StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and (_is_cutter(ob) or bool(_part_cutters(ob)))
+
+    def execute(self, context):
+        ob = context.active_object
+        cutter = bpy.data.objects.get(self.name) if self.name else ob
+        if not _is_cutter(cutter):
+            mods = _part_cutters(ob)
+            cutter = mods[-1].object if mods else None
+        if cutter is None:
+            self.report({'ERROR'}, "No cutter found")
+            return {'CANCELLED'}
+        part, mod = _cutter_modifier(cutter)
+        editing_cutter = context.edit_object == cutter
+        if editing_cutter:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        if mod is not None:
+            part.modifiers.remove(mod)
+        name = cutter.name
+        _remove_cutter(cutter)
+        if editing_cutter and part is not None:
+            _edit_only(context, part)
+        self.report({'INFO'}, f"Deleted {name}")
         return {'FINISHED'}
 
 
@@ -2912,36 +3247,33 @@ class VIEW3D_PT_average_vertex(_VertexToolsPanel, bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        st = context.scene.vertex_tools_avg
         fix_id = MESH_OT_move_last_to_average.bl_idname
         chain_id = MESH_OT_fix_vertex_chain.bl_idname
         extrude_id = MESH_OT_extrude_average_chain.bl_idname
+        placement = 'KEEP' if st.keep else 'AVERAGE'
 
-        layout.label(text="Fix Selected Vertex:")
-        col = layout.column(align=True)
-        _op(col, fix_id, "Smart: Average Distance", 'MODIFIER', mode='AUTO', placement='AVERAGE')
-        _op(col, fix_id, "Smart: Keep Distance", 'SNAP_NORMAL', mode='AUTO', placement='KEEP')
-        col = layout.column(align=True)
-        _op(col, fix_id, "Curve: Average Distance", 'CURVE_DATA', mode='CURVE', placement='AVERAGE')
-        _op(col, fix_id, "Curve: Keep Distance", 'PINNED', mode='CURVE', placement='KEEP')
-        col = layout.column(align=True)
-        _op(col, fix_id, "Circle: Average Distance", 'MESH_CIRCLE', mode='CIRCLE', placement='AVERAGE')
-        _op(col, fix_id, "Circle: Keep Distance", 'PROP_CON', mode='CIRCLE', placement='KEEP')
-        _op(layout, fix_id, "Move to Average", 'SNAP_MIDPOINT', mode='CENTER')
+        row = layout.row(align=True)
+        row.prop(st, "fit", expand=True)
+        layout.prop(st, "keep", toggle=True, icon='SNAP_NORMAL')
 
-        layout.separator()
-        layout.label(text="Fix Whole Chain:")
-        col = layout.column(align=True)
-        _op(col, chain_id, "Chain: Even Along Line", 'IPO_LINEAR', fit='LINE')
-        _op(col, chain_id, "Chain: Even Along Curve", 'IPO_BEZIER', fit='CURVE')
-        _op(col, chain_id, "Chain: Even Along Arc", 'IPO_CIRC', fit='CIRCLE')
-        _op(col, chain_id, "Chain: Full Circle", 'MESH_CIRCLE', fit='CIRCLE', placement='FULL')
+        # What the selection is, before pressing anything
+        for text, icon in selection_status(context, st.fit):
+            layout.label(text=text, icon=icon)
 
-        layout.separator()
-        layout.label(text="Extrude New Vertex:")
         col = layout.column(align=True)
-        _op(col, extrude_id, "Extrude Along Line", 'FORWARD', fit='LINE')
-        _op(col, extrude_id, "Extrude Along Curve", 'SPHERECURVE', fit='CURVE')
-        _op(col, extrude_id, "Extrude Along Circle", 'MESH_CIRCLE', fit='CIRCLE')
+        col.scale_y = 1.2
+        mode = {'LINE': 'AUTO', 'CURVE': 'CURVE', 'CIRCLE': 'CIRCLE'}[st.fit]
+        _op(col, fix_id, "Fix Last Vertex", 'MODIFIER', mode=mode, placement=placement)
+        if st.fit == 'CIRCLE':
+            row = col.row(align=True)
+            _op(row, chain_id, "Fix Chain", 'IPO_CIRC', fit='CIRCLE', placement=placement)
+            _op(row, chain_id, "Full Circle", 'MESH_CIRCLE', fit='CIRCLE', placement='FULL')
+        else:
+            _op(col, chain_id, "Fix Whole Chain", 'IPO_LINEAR' if st.fit == 'LINE' else 'IPO_BEZIER',
+                fit=st.fit, placement=placement)
+        _op(col, extrude_id, "Extrude New Vertex", 'FORWARD', fit=st.fit)
+        _op(layout, fix_id, "Move Last to Average", 'SNAP_MIDPOINT', mode='CENTER')
 
 
 class VIEW3D_PT_average_vertex_preview(_VertexToolsPanel, bpy.types.Panel):
@@ -3020,6 +3352,8 @@ class VIEW3D_PT_draw_with_vertex(_VertexToolsPanel, bpy.types.Panel):
             row.prop_enum(s, "plane_mode", item)
         if s.plane_mode == 'SURFACE':
             layout.prop(s, "surface_offset")
+        else:
+            layout.label(text="Through the 3D cursor (or a snapped 1st point)", icon='INFO')
 
         # Snapping toggles as one compact icon row (hover for the name)
         row = _labeled_row(layout, "Snap")
@@ -3039,8 +3373,6 @@ class VIEW3D_PT_draw_with_vertex(_VertexToolsPanel, bpy.types.Panel):
         sub.active = s.use_merge
         sub.prop(s, "merge_distance")
         col.prop(s, "angle_step")
-
-        layout.label(text="Plane passes through the 3D cursor", icon='INFO')
 
 
 class VIEW3D_PT_bool_cutters(_VertexToolsPanel, bpy.types.Panel):
@@ -3070,6 +3402,7 @@ class VIEW3D_PT_bool_cutters(_VertexToolsPanel, bpy.types.Panel):
             row.scale_y = 1.3
             row.operator(OBJECT_OT_vertex_tools_back_to_mesh.bl_idname, icon='LOOP_BACK')
             row.operator(OBJECT_OT_vertex_tools_apply_bool.bl_idname, icon='CHECKMARK')
+            layout.operator(OBJECT_OT_vertex_tools_delete_cutter.bl_idname, icon='TRASH')
         else:
             col = layout.column(align=True)
             for m in _part_cutters(ob):
@@ -3078,6 +3411,7 @@ class VIEW3D_PT_bool_cutters(_VertexToolsPanel, bpy.types.Panel):
                           else 'SELECT_EXTEND' if m.operation == 'UNION' else 'SELECT_INTERSECT')
                 _op(row, OBJECT_OT_vertex_tools_edit_cutter.bl_idname, "", 'EDITMODE_HLT', name=m.object.name)
                 row.prop(m, "show_viewport", text="")
+                _op(row, OBJECT_OT_vertex_tools_delete_cutter.bl_idname, "", 'X', name=m.object.name)
             row = layout.row()
             row.scale_y = 1.3
             row.operator(OBJECT_OT_vertex_tools_apply_bool.bl_idname, text="Apply All Bools", icon='CHECKMARK')
@@ -3159,6 +3493,17 @@ class VIEW3D_MT_vertex_tools(bpy.types.Menu):
         col.separator()
         col.operator(MESH_OT_flatten_to_plane.bl_idname)
 
+        # Only when there's a cutter to work with (editing a cutter, or a mesh that has some)
+        ob = context.active_object
+        if ob is not None and (_is_cutter(ob) or _part_cutters(ob)):
+            col = row.column()
+            col.label(text="Bool Cutters", icon='MOD_BOOLEAN')
+            col.operator(OBJECT_OT_vertex_tools_edit_cutter.bl_idname)
+            col.operator(OBJECT_OT_vertex_tools_back_to_mesh.bl_idname)
+            col.operator(OBJECT_OT_vertex_tools_apply_bool.bl_idname,
+                         text="Apply Bool" if _is_cutter(ob) else "Apply All Bools")
+            col.operator(OBJECT_OT_vertex_tools_delete_cutter.bl_idname)
+
 
 def average_vertex_menu_func(self, context):
     self.layout.separator()
@@ -3192,6 +3537,7 @@ classes = (
     OBJECT_OT_vertex_tools_edit_cutter,
     OBJECT_OT_vertex_tools_back_to_mesh,
     OBJECT_OT_vertex_tools_apply_bool,
+    OBJECT_OT_vertex_tools_delete_cutter,
     VIEW3D_OT_align_view_to_selection,
     VIEW3D_OT_vertex_tools_view_back,
     VIEW3D_OT_align_and_draw,
